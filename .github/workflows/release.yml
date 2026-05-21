@@ -29,6 +29,10 @@ jobs:
         run: pyinstaller ch2sloppak.spec
         working-directory: ch2sloppak
 
+      - name: Rename binary (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: mv ch2sloppak/dist/ch2sloppak ch2sloppak/dist/ch2sloppak-${{ runner.os == 'Linux' && 'linux' || 'macos' }}
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
