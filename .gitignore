@@ -1,0 +1,35 @@
+# Personal notes
+MY_USEFUL_NOTES.txt
+
+# Claude Code project settings (contains local paths and permissions)
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+env/
+.env
+
+# PyInstaller
+*.spec.bak
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
