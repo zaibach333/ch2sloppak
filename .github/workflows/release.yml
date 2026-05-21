@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyinstaller PyYAML
+        working-directory: ch2sloppak
+
+      - name: Build
+        run: pyinstaller ch2sloppak.spec
+        working-directory: ch2sloppak
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ch2sloppak/dist/ch2sloppak*

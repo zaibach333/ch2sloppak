@@ -148,6 +148,6 @@ Routed to the piano roll via `type: piano` in the manifest.
 ## Limitations
 
 - No `.chart` support for Pro Keys (`.mid` only)
-- No 5-lane drums decoding (4-lane Pro only)
+- No 5-lane drums decoding (Pro drums only)
 - No chord-template grouping (simultaneous notes written as individual notes)
 - Drum highway difficulty slider shows Expert only (drum_tab format limitation)
