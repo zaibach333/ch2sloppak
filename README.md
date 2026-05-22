@@ -50,6 +50,43 @@ RS arrangements win on ID collision (e.g. if RS already has `lead`/`bass`,
 the CH gamepad versions are skipped). RS audio stems pass through unchanged;
 CH audio is discarded. All original RS manifest fields are preserved.
 
+### batch
+
+Convert all CH song folders found recursively under a root directory:
+
+```bash
+python ch2sloppak.py batch <path/to/ch-songs-root>
+# → converts each CH folder, writes .sloppak next to each source folder
+
+python ch2sloppak.py batch <root> -o <output-dir>
+# → all converted and merged outputs go to the specified directory
+
+# Auto-merge with a sloppak library — songs matched by artist+title are
+# merged instead of converted standalone:
+python ch2sloppak.py batch <root> --library <path/to/sloppaks>
+# → merged +ch.sloppak files land next to their originals in the library
+
+python ch2sloppak.py batch <root> --library <path/to/sloppaks> -o <output-dir>
+# → merged and converted outputs all go to output-dir
+
+# Overwrite existing output files (default is to skip them):
+python ch2sloppak.py batch <root> --library <path/to/sloppaks> -o <output-dir> --force
+```
+
+**Default skip behaviour**: if a `.sloppak` output file already exists it is
+skipped. Use `--force` to overwrite. Songs skipped because all their CH tracks
+are already present in the matched sloppak are also skipped silently.
+
+**Log files** written to the calling directory when applicable:
+
+| File | Written when |
+|---|---|
+| `mergelog.txt` | At least one merge was performed |
+| `skipped.txt` | At least one output file was skipped due to already existing |
+
+Library matching normalises artist and title (lowercase, punctuation stripped)
+for comparison. First `.sloppak` match per song wins.
+
 ## What gets converted
 
 ### Chart formats

@@ -28,6 +28,7 @@ from writers import lyrics as lyrics_writer
 from writers import manifest as manifest_writer
 from writers import sloppak as sloppak_writer
 import merge as merge_mod
+import batch as batch_mod
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +181,8 @@ def convert(song_dir, output_path=None, verbose=True):
     # --- stems + cover (discover before manifest so both are accurate) ---
     stem_ids   = sloppak_writer.find_stem_ids(song_dir)
     cover_path = sloppak_writer.find_cover(song_dir)
-    cover_filename = os.path.basename(cover_path) if cover_path else None
+    cover_filename = ("cover" + os.path.splitext(cover_path)[1].lower()
+                      if cover_path else None)
 
     # --- build manifest ---
     arrangement_drum_tabs = {
@@ -258,6 +260,23 @@ def main():
     mrg.add_argument("-q", "--quiet", action="store_true",
                      help="Suppress progress output")
 
+    # --- batch ---
+    bat = sub.add_parser(
+        "batch",
+        help="Convert all CH song folders found under a root directory",
+    )
+    bat.add_argument("root_dir", help="Root directory to scan recursively")
+    bat.add_argument("-o", "--output", metavar="DIR",
+                     help="Directory for output .sloppak files "
+                          "(default: next to each source folder)")
+    bat.add_argument("--library", metavar="DIR",
+                     help="Sloppak library directory — when provided, matching "
+                          "songs are merged instead of converted standalone")
+    bat.add_argument("--force", action="store_true",
+                     help="Overwrite existing output files (default: skip them)")
+    bat.add_argument("-q", "--quiet", action="store_true",
+                     help="Suppress progress output")
+
     args = parser.parse_args()
 
     # Backwards-compatible: no subcommand → treat first positional as song_folder
@@ -289,6 +308,15 @@ def main():
                 verbose         = not args.quiet,
             )
             print(f"Done: {out}")
+
+        elif args.command == "batch":
+            batch_mod.run(
+                root_dir    = args.root_dir,
+                output_dir  = args.output,
+                library_dir = args.library,
+                force       = args.force,
+                verbose     = not args.quiet,
+            )
 
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
