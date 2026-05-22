@@ -12,7 +12,6 @@ A mergelog.txt is written to the calling directory listing every merge.
 import datetime
 import os
 import re
-import subprocess
 import zipfile
 from difflib import SequenceMatcher
 
@@ -23,25 +22,14 @@ import yaml
 _GAMEPAD_IDS = {"lead": "lead-gamepad", "bass": "bass-gamepad"}
 
 # Fuzzy match thresholds (SequenceMatcher ratio, 0–1).
-_FUZZY_COMBINED_THRESHOLD = 0.60   # artist+title sequence similarity
-_FUZZY_TITLE_THRESHOLD    = 0.72   # title-only sequence similarity
-_JACCARD_COMBINED_THRESHOLD = 0.45 # word-overlap on artist+title
-_JACCARD_TITLE_THRESHOLD    = 0.55 # word-overlap on title alone
-
-# Duration tolerance for ffprobe-based matching (seconds).
-_DURATION_TOLERANCE_S = 15.0
-# Minimum text similarity required when duration is the deciding factor —
-# prevents matching two songs of the same length but completely different names.
-_DURATION_MIN_TEXT_SIM = 0.30
+_FUZZY_COMBINED_THRESHOLD = 0.85   # artist+title sequence similarity
+_FUZZY_DEEP_THRESHOLD     = 0.82   # artist+title after noise-token stripping
 
 # Common noise tokens stripped before deep comparison.
 _NOISE = re.compile(
     r"\b(feat|ft|featuring|the|a|an|and|remaster|remastered|live|official|"
     r"version|deluxe|edition|ep|lp|single|radio|edit|cover|acoustic|demo)\b"
 )
-
-# Audio file extensions to probe for CH duration
-_AUDIO_EXTS = {".ogg", ".mp3", ".opus", ".wav", ".flac", ".m4a"}
 
 
 def _normalize(s):
@@ -60,123 +48,14 @@ def _sim(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 
-def _jaccard(a, b):
-    wa, wb = set(a.split()), set(b.split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / len(wa | wb)
-
-
-def _content_duration(path):
-    """
-    Use ffmpeg silencedetect to measure the actual musical content duration,
-    trimming leading and trailing silence from both ends.
-
-    Returns content duration in seconds, or None on failure.
-
-    silencedetect noise floor: -45 dB, minimum silence: 0.5 s.
-    These values tolerate breath noise and light room tone without
-    mis-classifying quiet passages as silence.
-    """
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-i", path,
-             "-af", "silencedetect=noise=-45dB:d=0.5",
-             "-f", "null", "-"],
-            capture_output=True, text=True, timeout=120,
-        )
-        output = r.stderr  # ffmpeg diagnostic output goes to stderr
-
-        # Total duration from the header line
-        total = None
-        for line in output.splitlines():
-            m = re.search(r"Duration:\s+(\d+):(\d+):(\d+\.?\d*)", line)
-            if m:
-                total = (float(m.group(1)) * 3600
-                         + float(m.group(2)) * 60
-                         + float(m.group(3)))
-                break
-        if total is None:
-            return None
-
-        # Collect silence intervals
-        starts, ends = [], []
-        for line in output.splitlines():
-            ms = re.search(r"silence_start:\s*([\d.e+-]+)", line)
-            me = re.search(r"silence_end:\s*([\d.e+-]+)", line)
-            if ms:
-                starts.append(float(ms.group(1)))
-            if me:
-                ends.append(float(me.group(1)))
-
-        # Leading silence: a silence interval that begins at or before 0.1 s
-        content_start = 0.0
-        if ends and starts and starts[0] <= 0.1:
-            content_start = ends[0]
-        elif ends and not starts:
-            # silence_end with no preceding silence_start → starts at 0
-            content_start = ends[0]
-
-        # Trailing silence: a silence interval with no matching end
-        # (extends to EOF) or whose end equals/exceeds total duration
-        content_end = total
-        if starts:
-            last_start = starts[-1]
-            last_has_end = len(ends) >= len(starts)
-            if not last_has_end or (ends and ends[-1] >= total - 0.1):
-                content_end = last_start
-
-        return max(0.0, content_end - content_start)
-
-    except Exception:
-        return None
-
-
-def _ch_audio_duration(ch_dir):
-    """Return content duration of the first audio file found in ch_dir, or None."""
-    for fname in sorted(os.listdir(ch_dir)):
-        if os.path.splitext(fname)[1].lower() in _AUDIO_EXTS:
-            return _content_duration(os.path.join(ch_dir, fname))
-    return None
-
-
-def _sloppak_audio_duration(sloppak_path):
-    """
-    Extract the first stem from the sloppak zip to a temp file,
-    measure its content duration, then delete the temp file.
-    Returns content duration in seconds or None.
-    """
-    import tempfile
-    import shutil
-    try:
-        with zipfile.ZipFile(sloppak_path) as zf:
-            stems = [n for n in zf.namelist()
-                     if n.startswith("stems/") and n.endswith(".ogg")]
-            if not stems:
-                return None
-            tmp = tempfile.mktemp(suffix=".ogg")
-            with zf.open(stems[0]) as src, open(tmp, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-        dur = _content_duration(tmp)
-        os.unlink(tmp)
-        return dur
-    except Exception:
-        return None
-
-
-def find_match(artist, title, library_index, ch_dir=None):
+def find_match(artist, title, library_index):
     """
     Find the best matching sloppak for the given artist+title.
 
     Matching tiers (first hit wins):
       1. Exact normalized key
-      2. Sequence fuzzy on artist+title       ≥ FUZZY_COMBINED_THRESHOLD
-      3. Sequence fuzzy deep (noise stripped)  ≥ FUZZY_COMBINED_THRESHOLD
-      4. Jaccard word-overlap on artist+title  ≥ JACCARD_COMBINED_THRESHOLD
-      5. Sequence fuzzy title-only             ≥ FUZZY_TITLE_THRESHOLD
-      6. Jaccard word-overlap title-only       ≥ JACCARD_TITLE_THRESHOLD
-      7. Audio duration match via ffprobe      within DURATION_TOLERANCE_S
-         (requires ch_dir; only fires if text similarity ≥ DURATION_MIN_TEXT_SIM)
+      2. Sequence fuzzy on artist+title            ≥ FUZZY_COMBINED_THRESHOLD
+      3. Sequence fuzzy deep (noise tokens stripped) ≥ FUZZY_DEEP_THRESHOLD
 
     Returns (path, manifest, score_description) or (None, None, None).
     """
@@ -188,82 +67,31 @@ def find_match(artist, title, library_index, ch_dir=None):
     # Pre-compute per-candidate normalised strings once
     candidates = []
     for cand_key, (path, manifest) in library_index.items():
-        cand_norm   = cand_key
-        cand_deep   = (_normalize_deep(manifest.get("artist", "")) + " " +
-                       _normalize_deep(manifest.get("title", ""))).strip()
-        cand_title  = _normalize(manifest.get("title", ""))
-        candidates.append((path, manifest, cand_norm, cand_deep, cand_title))
+        cand_deep = (_normalize_deep(manifest.get("artist", "")) + " " +
+                     _normalize_deep(manifest.get("title", ""))).strip()
+        candidates.append((path, manifest, cand_key, cand_deep))
 
     # 1. Exact
     if key in library_index:
         return (*library_index[key], "exact")
 
-    # 2 & 3. Sequence fuzzy (normal + deep)
-    for q, cand_field, label in [
-        (key,      2, "fuzzy"),
-        (deep_key, 3, "fuzzy-deep"),
-    ]:
-        best_score, best_item = 0.0, None
-        for path, manifest, cand_norm, cand_deep, _ in candidates:
-            cq = cand_norm if cand_field == 2 else cand_deep
-            score = _sim(q, cq)
-            if score > best_score:
-                best_score, best_item = score, (path, manifest)
-        if best_item and best_score >= _FUZZY_COMBINED_THRESHOLD:
-            return (*best_item, f"{label} {best_score:.0%}")
-
-    # 4. Jaccard on artist+title
+    # 2. Sequence fuzzy on normalized artist+title
     best_score, best_item = 0.0, None
-    for path, manifest, _, cand_deep, _ in candidates:
-        score = _jaccard(deep_key, cand_deep)
+    for path, manifest, cand_norm, _ in candidates:
+        score = _sim(key, cand_norm)
         if score > best_score:
             best_score, best_item = score, (path, manifest)
-    if best_item and best_score >= _JACCARD_COMBINED_THRESHOLD:
-        return (*best_item, f"jaccard {best_score:.0%}")
+    if best_item and best_score >= _FUZZY_COMBINED_THRESHOLD:
+        return (*best_item, f"fuzzy {best_score:.0%}")
 
-    # 5. Sequence fuzzy title-only
-    if norm_title:
-        best_score, best_item = 0.0, None
-        for path, manifest, _, _, cand_title in candidates:
-            score = _sim(norm_title, cand_title)
-            if score > best_score:
-                best_score, best_item = score, (path, manifest)
-        if best_item and best_score >= _FUZZY_TITLE_THRESHOLD:
-            return (*best_item, f"title-fuzzy {best_score:.0%}")
-
-    # 6. Jaccard title-only
-    if norm_title:
-        deep_title = _normalize_deep(title)
-        best_score, best_item = 0.0, None
-        for path, manifest, _, _, cand_title in candidates:
-            score = _jaccard(deep_title, _normalize_deep(manifest.get("title", "")))
-            if score > best_score:
-                best_score, best_item = score, (path, manifest)
-        if best_item and best_score >= _JACCARD_TITLE_THRESHOLD:
-            return (*best_item, f"title-jaccard {best_score:.0%}")
-
-    # 7. Audio duration fallback (requires ffprobe + ch_dir)
-    if ch_dir:
-        ch_dur = _ch_audio_duration(ch_dir)
-        if ch_dur:
-            # Score each candidate by text similarity; only consider those
-            # whose manifest duration is close enough.
-            best_score, best_item = 0.0, None
-            for path, manifest, cand_norm, cand_deep, _ in candidates:
-                # Check manifest duration first (cheap); fall back to probing
-                # the sloppak audio only when manifest has no duration.
-                m_dur = manifest.get("duration")
-                if m_dur:
-                    m_dur = float(m_dur)
-                else:
-                    m_dur = _sloppak_audio_duration(path)
-                if m_dur is None or abs(m_dur - ch_dur) > _DURATION_TOLERANCE_S:
-                    continue
-                text_score = max(_sim(key, cand_norm), _sim(deep_key, cand_deep))
-                if text_score >= _DURATION_MIN_TEXT_SIM and text_score > best_score:
-                    best_score, best_item = text_score, (path, manifest)
-            if best_item:
-                return (*best_item, f"duration+text {best_score:.0%}")
+    # 3. Sequence fuzzy after noise-token stripping
+    best_score, best_item = 0.0, None
+    for path, manifest, _, cand_deep in candidates:
+        score = _sim(deep_key, cand_deep)
+        if score > best_score:
+            best_score, best_item = score, (path, manifest)
+    if best_item and best_score >= _FUZZY_DEEP_THRESHOLD:
+        return (*best_item, f"fuzzy-deep {best_score:.0%}")
 
     return None, None, None
 
@@ -459,7 +287,7 @@ def run(root_dir, output_dir=None, library_dir=None, force=False, verbose=True):
             rs_path = rs_manifest = None
             if library_index:
                 rs_path, rs_manifest, match_desc = find_match(
-                    artist, title, library_index, ch_dir=ch_dir)
+                    artist, title, library_index)
                 if rs_path and verbose:
                     print(f"  Match ({match_desc}): {os.path.basename(rs_path)}")
 
