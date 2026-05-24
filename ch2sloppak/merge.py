@@ -177,6 +177,31 @@ _FINE_START_S = 30    # CH start time of fine clip (past most intros)
 _FINE_SEARCH_S = 1.5  # ±seconds fallback (used when beat interval unknown)
 
 
+_DRUM_AUDIO_EXTS = (".ogg", ".mp3", ".opus", ".wav", ".flac")
+
+
+def _find_ch_drum_files(ch_dir):
+    """Return a list of CH drum stem paths (merged stem, or splits 1-4).
+
+    Drum audio has sharp, distinctive transients that produce much cleaner
+    onset-envelope correlation than a full mix.  Returns [] if none found.
+    """
+    # Merged drum stem
+    for ext in _DRUM_AUDIO_EXTS:
+        p = os.path.join(ch_dir, "drums" + ext)
+        if os.path.isfile(p):
+            return [p]
+    # Individual splits (drums_1 … drums_4)
+    splits = []
+    for i in range(1, 5):
+        for ext in _DRUM_AUDIO_EXTS:
+            p = os.path.join(ch_dir, f"drums_{i}{ext}")
+            if os.path.isfile(p):
+                splits.append(p)
+                break
+    return splits
+
+
 def _find_ch_audio(ch_dir):
     for name in ("song.ogg", "song.mp3", "song.opus",
                  "audio.ogg", "guitar.ogg", "guitar.mp3"):
@@ -263,47 +288,90 @@ def _xcorr_best(a, b, max_lag):
     return best_lag, best_corr
 
 
+def _sum_pcm(paths, sample_rate, start_s=0.0, duration_s=None):
+    """Extract PCM from each path and return a sample-wise sum (list of int).
+
+    Truncates all signals to the shortest one so they can be summed directly.
+    Returns [] if no valid signal is found.
+    """
+    signals = []
+    for p in paths:
+        pcm = _extract_pcm(p, sample_rate, start_s=start_s, duration_s=duration_s)
+        if pcm:
+            signals.append(pcm)
+    if not signals:
+        return []
+    min_len = min(len(s) for s in signals)
+    return [sum(s[i] for s in signals) for i in range(min_len)]
+
+
+def _pick_rs_stem(rs_sloppak_path):
+    """Return (zip_entry_name, label) preferring the drums stem."""
+    with zipfile.ZipFile(rs_sloppak_path, "r") as zf:
+        stems = [n for n in zf.namelist()
+                 if n.startswith("stems/") and n.endswith(".ogg")]
+    if not stems:
+        return None, None
+    drums = next((n for n in stems if n == "stems/drums.ogg"), None)
+    if drums:
+        return drums, "drums"
+    full = next((n for n in stems if n in ("stems/full.ogg", "stems/song.ogg")), None)
+    return (full or stems[0]), "mix"
+
+
 def _audio_align(ch_dir, rs_sloppak_path, verbose):
+    """Two-level onset alignment.
+
+    Uses CH drum stems (split or merged) when available — drum transients
+    are far more distinctive than a full mix and produce cleaner correlation.
+    Falls back to any CH audio if no drum stems are found.  On the RS side,
+    prefers stems/drums.ogg over the full mix for the same reason.
+
+    Returns (offset_seconds, used_drums: bool) or (None, False) on failure.
     """
-    Two-level waveform alignment between the CH audio and the first RS stem.
-    Returns offset_seconds (add to CH audio times) or None on failure.
-    """
-    ch_audio = _find_ch_audio(ch_dir)
-    if not ch_audio:
+    # Choose CH source: drum stems > full mix
+    ch_drum_files = _find_ch_drum_files(ch_dir)
+    if ch_drum_files:
+        ch_paths  = ch_drum_files
+        ch_label  = f"drums ({len(ch_drum_files)} stem{'s' if len(ch_drum_files) > 1 else ''})"
+        use_drums = True
+    else:
+        ch_audio = _find_ch_audio(ch_dir)
+        if not ch_audio:
+            if verbose:
+                print("  audio    : no CH audio found")
+            return None, False
+        ch_paths  = [ch_audio]
+        ch_label  = "mix"
+        use_drums = False
+
+    rs_stem_name, rs_label = _pick_rs_stem(rs_sloppak_path)
+    if not rs_stem_name:
         if verbose:
-            print("  audio    : no CH audio found")
-        return None
+            print("  audio    : no RS stems found")
+        return None, False
 
     rs_tmp = None
     try:
         with zipfile.ZipFile(rs_sloppak_path, "r") as zf:
-            stems = [n for n in zf.namelist()
-                     if n.startswith("stems/") and n.endswith(".ogg")]
-            if not stems:
-                if verbose:
-                    print("  audio    : no RS stems found")
-                return None
             fd, rs_tmp = tempfile.mkstemp(suffix=".ogg")
             os.close(fd)
             with open(rs_tmp, "wb") as f:
-                f.write(zf.read(stems[0]))
+                f.write(zf.read(rs_stem_name))
 
         if verbose:
-            print("  audio    : aligning waveforms…")
+            print(f"  audio    : CH {ch_label} → RS {rs_label} …")
 
-        # --- Level 1: coarse onset-strength correlation ---
-        # Onset envelope (positive energy derivative) peaks at drum hits and
-        # string attacks — much more distinctive than raw energy for songs
-        # with constant loudness and repeating riffs (e.g. metal, rock).
-        ch_env = _normalize(_onset_envelope(
-            _extract_pcm(ch_audio, _COARSE_SR, duration_s=_COARSE_SECS),
-            _COARSE_WIN))
-        rs_env = _normalize(_onset_envelope(
-            _extract_pcm(rs_tmp, _COARSE_SR, duration_s=_COARSE_SECS),
-            _COARSE_WIN))
+        # --- Level 1: coarse onset-envelope correlation (50 Hz) ---
+        # Sum PCM across CH drum splits so every hit contributes to the signal.
+        ch_coarse_pcm = _sum_pcm(ch_paths, _COARSE_SR, duration_s=_COARSE_SECS)
+        rs_coarse_pcm = _extract_pcm(rs_tmp, _COARSE_SR, duration_s=_COARSE_SECS)
+
+        ch_env = _normalize(_onset_envelope(ch_coarse_pcm, _COARSE_WIN))
+        rs_env = _normalize(_onset_envelope(rs_coarse_pcm, _COARSE_WIN))
 
         if not ch_env or not rs_env:
-            return None
+            return None, False
 
         lag1, _ = _xcorr_best(ch_env, rs_env, int(60 * _COARSE_RATE))
         offset1_s = -lag1 / _COARSE_RATE
@@ -311,36 +379,34 @@ def _audio_align(ch_dir, rs_sloppak_path, verbose):
         if verbose:
             print(f"  audio    : coarse {offset1_s:+.2f} s")
 
-        # --- Level 2: fine waveform correlation ---
-        # Take a clip from partway into the song (past the intro) and
-        # the corresponding position in RS (adjusted by coarse offset).
+        # --- Level 2: fine PCM correlation (200 Hz, ±1.5 s window) ---
+        # Summing raw PCM from drum splits amplifies transients further.
         rs_fine_start = max(0.0, _FINE_START_S + offset1_s)
-        ch_fine = _normalize(_extract_pcm(
-            ch_audio, _FINE_SR,
-            start_s=_FINE_START_S, duration_s=_FINE_CLIP_S))
-        rs_fine = _normalize(_extract_pcm(
-            rs_tmp, _FINE_SR,
-            start_s=rs_fine_start, duration_s=_FINE_CLIP_S))
+        ch_fine_pcm   = _sum_pcm(ch_paths, _FINE_SR,
+                                  start_s=_FINE_START_S, duration_s=_FINE_CLIP_S)
+        rs_fine_pcm   = _extract_pcm(rs_tmp, _FINE_SR,
+                                      start_s=rs_fine_start, duration_s=_FINE_CLIP_S)
+
+        ch_fine = _normalize(ch_fine_pcm)
+        rs_fine = _normalize(rs_fine_pcm)
 
         if ch_fine and rs_fine:
-            fine_search_s = _FINE_SEARCH_S
             lag2, corr2 = _xcorr_best(
-                ch_fine, rs_fine, max(1, int(fine_search_s * _FINE_SR)))
-            offset2_s   = -lag2 / _FINE_SR
-            total        = offset1_s + offset2_s
+                ch_fine, rs_fine, max(1, int(_FINE_SEARCH_S * _FINE_SR)))
+            offset2_s = -lag2 / _FINE_SR
+            total     = offset1_s + offset2_s
             if verbose:
-                window_ms = fine_search_s * 1000
                 print(f"  audio    : fine {offset2_s:+.3f} s "
-                      f"(±{window_ms:.0f} ms window) → "
+                      f"(±{_FINE_SEARCH_S * 1000:.0f} ms) → "
                       f"total {total:+.3f} s  (corr {corr2:.3f})")
-            return total
+            return total, use_drums
 
-        return offset1_s
+        return offset1_s, use_drums
 
     except Exception as exc:
         if verbose:
             print(f"  audio    : failed ({exc})")
-        return None
+        return None, False
     finally:
         if rs_tmp:
             try:
@@ -353,12 +419,14 @@ def _audio_align(ch_dir, rs_sloppak_path, verbose):
 # Beat alignment
 # ---------------------------------------------------------------------------
 
-def _ibi_cross_correlate(ch_times, rs_times, max_k=128, prior_offset_s=None):
+def _ibi_cross_correlate(ch_times, rs_times, max_k=128, prior_offset_s=None,
+                         prior_scale=2.0):
     """
     Find the integer index shift K that minimises IBI MSE.
     When prior_offset_s is supplied, a soft penalty discourages K values
-    whose implied mean offset differs from the prior by more than ~2 s,
-    letting the audio estimate break ties on constant-tempo songs.
+    whose implied mean offset differs from the prior by more than prior_scale
+    seconds.  Use a small prior_scale (e.g. 0.25) to anchor tightly to a
+    drum-derived offset and prevent IBI from picking a neighbouring beat.
     Returns (best_k, ibi_rms_ms).
     """
     ch_ibis = [ch_times[i + 1] - ch_times[i] for i in range(len(ch_times) - 1)]
@@ -386,7 +454,7 @@ def _ibi_cross_correlate(ch_times, rs_times, max_k=128, prior_offset_s=None):
                 mean_off = sum(
                     rs_times[r0 + i] - ch_times[c0 + i] for i in range(np_)
                 ) / np_
-                score += ((mean_off - prior_offset_s) / 2.0) ** 2
+                score += ((mean_off - prior_offset_s) / prior_scale) ** 2
         if score < best_score:
             best_score = score
             best_k     = k
@@ -433,10 +501,12 @@ def _build_shift_fn(ch_times, rs_times, k):
     return shift_fn
 
 
-def _auto_align(ch_beats, rs_beats, prior_offset_s=None):
+def _auto_align(ch_beats, rs_beats, prior_offset_s=None, prior_scale=2.0):
     """
     Auto-align CH beat list to RS beat list, optionally biased by an audio
     cross-correlation prior.  Returns (shift_fn, info_dict).
+    prior_scale controls how tightly the beat K is pinned to prior_offset_s:
+    small value (e.g. 0.25) = drum-anchor mode; large (2.0) = loose.
     """
     ch_times = [b["time"] for b in ch_beats]
     rs_times = [b["time"] for b in rs_beats]
@@ -444,7 +514,9 @@ def _auto_align(ch_beats, rs_beats, prior_offset_s=None):
     if not ch_times or not rs_times:
         return lambda t: t, {"k": 0, "ibi_rms_ms": None, "mean_offset_ms": 0.0, "n_pairs": 0}
 
-    k, ibi_rms_ms = _ibi_cross_correlate(ch_times, rs_times, prior_offset_s=prior_offset_s)
+    k, ibi_rms_ms = _ibi_cross_correlate(ch_times, rs_times,
+                                          prior_offset_s=prior_offset_s,
+                                          prior_scale=prior_scale)
 
     c0 = max(0,  k)
     r0 = max(0, -k)
@@ -622,15 +694,18 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
         # Step 1: best available coarse offset estimate (lyrics > audio > none)
         raw_ch_lyrics = parsed.get("lyrics", [])
         prior_offset_s = _lyrics_align(raw_ch_lyrics, rs["rs_lyrics"], verbose)
+        drum_anchor = False
 
         if prior_offset_s is None:
-            audio_offset_s = _audio_align(ch_dir, rs_sloppak_path, verbose)
+            audio_offset_s, drum_anchor = _audio_align(ch_dir, rs_sloppak_path, verbose)
             if audio_offset_s is not None:
                 # Audio correlation gives CH-audio → RS-audio offset.
                 # CH audio position = CH chart time + ch_audio_delay_s
                 # (positive delay = audio has that many seconds of pre-roll before notes).
                 # So CH-chart → RS-chart offset = audio_corr + delay.
                 prior_offset_s = audio_offset_s + ch_audio_delay_s
+                if verbose and drum_anchor:
+                    print("  align    : drum stems used as master reference")
 
         if nudge_ms:
             prior_offset_s = (prior_offset_s or 0.0) + nudge_ms / 1000.0
@@ -638,11 +713,15 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
                 print(f"  nudge    : {nudge_ms:+.1f} ms applied to prior")
 
         # Step 2: beat-map IBI → piecewise refinement biased by audio/lyrics prior.
-        # The prior locks in the correct beat-index shift K so IBI doesn't pick
-        # a neighbouring beat on constant-tempo songs.
+        # When drum stems provided the prior, use a tight scale (0.25 s) so the
+        # beat K cannot drift more than ~250 ms from the drum-derived anchor —
+        # the drums ARE the timing reference; IBI only handles tempo stretch.
+        prior_scale = 0.25 if drum_anchor else 2.0
         if ch_beats and rs["rs_beats"]:
             shift_fn, info = _auto_align(
-                ch_beats, rs["rs_beats"], prior_offset_s=prior_offset_s
+                ch_beats, rs["rs_beats"],
+                prior_offset_s=prior_offset_s,
+                prior_scale=prior_scale,
             )
             if verbose:
                 k   = info["k"]
@@ -651,13 +730,15 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
                 n   = info["n_pairs"]
                 k_desc  = f"K={k:+d}" if k != 0 else "K=0"
                 rms_str = f"{rms:.1f} ms" if rms is not None and rms < 9999 else "n/a"
-                print(f"  beats    : {k_desc}, mean offset {off:+.1f} ms, IBI RMS {rms_str} ({n} pairs)")
+                anchor  = " [drum-anchored]" if drum_anchor else ""
+                print(f"  beats    : {k_desc}, mean offset {off:+.1f} ms, IBI RMS {rms_str} ({n} pairs){anchor}")
                 if rms is not None and rms > 20.0:
                     print(f"  WARNING  : high IBI residual — try --offset if notes feel off")
         elif prior_offset_s is not None:
             shift_fn = lambda t, p=prior_offset_s: t + p
             if verbose:
-                print(f"  align    : audio offset {prior_offset_s * 1000:+.1f} ms (no beat map)")
+                src = "drum" if drum_anchor else "audio"
+                print(f"  align    : {src} offset {prior_offset_s * 1000:+.1f} ms (no beat map)")
         else:
             shift_fn = lambda t: t
             if verbose:
