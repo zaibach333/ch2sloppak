@@ -36,7 +36,8 @@ _ARRANGEMENT_TYPE = {
 
 
 def build(metadata, arrangement_ids, stem_ids, cover_filename, has_lyrics,
-          rs_arrangements=None, has_drum_tab=False, drum_tabs=None):
+          rs_arrangements=None, has_drum_tab=False, drum_tabs=None,
+          arrangement_names=None):
     """
     Build a manifest dict.
 
@@ -62,15 +63,18 @@ def build(metadata, arrangement_ids, stem_ids, cover_filename, has_lyrics,
     except (TypeError, ValueError):
         pass
 
-    rs_by_id  = {a["id"]: a for a in (rs_arrangements or [])}
-    drum_tabs = drum_tabs or {}
+    rs_by_id         = {a["id"]: a for a in (rs_arrangements or [])}
+    drum_tabs        = drum_tabs or {}
+    arrangement_names = arrangement_names or {}
 
     arrangements = []
     for aid in arrangement_ids:
         rs = rs_by_id.get(aid, {})
         entry = {
             "id":     aid,
-            "name":   rs.get("name") or _ARRANGEMENT_DISPLAY.get(aid, aid.replace("-", " ").title()),
+            "name":   (arrangement_names.get(aid)
+                       or rs.get("name")
+                       or _ARRANGEMENT_DISPLAY.get(aid, aid.replace("-", " ").title())),
             "file":   f"arrangements/{aid}.json",
             "tuning": rs.get("tuning") or _ARRANGEMENT_TUNING.get(aid, [0, 0, 0, 0, 0, 0]),
             "capo":   rs.get("capo", 0),

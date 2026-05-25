@@ -226,6 +226,10 @@ def convert(song_dir, output_path=None, verbose=True, split_drums=False):
                 cover_filename=cover_filename,
                 has_lyrics=bool(lyrics_data),
                 drum_tabs={"drums": "drum_tab_drums.json"} if diff_drum_tabs else {},
+                arrangement_names={
+                    "drums":       f"Drums ({diff_name})",
+                    "drums_score": f"Drums Score ({diff_name})",
+                },
             )
             sloppak_writer.write(
                 output_path=diff_out,
