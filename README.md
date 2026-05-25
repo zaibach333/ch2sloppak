@@ -101,10 +101,10 @@ python ch2sloppak.py batch <root> --library <path/to/sloppaks> -o <output-dir>
 # Overwrite existing output files (default is to skip them):
 python ch2sloppak.py batch <root> --library <path/to/sloppaks> -o <output-dir> --force
 
-# Split drums into per-difficulty arrangements across the whole batch:
+# Split drums into per-difficulty files across the whole batch:
 python ch2sloppak.py batch <root> --library <path/to/sloppaks> --split-drums
-# Duplicate detection uses difficulty-specific IDs (drums-expert, etc.) so
-# songs already converted without --split-drums will be re-merged/re-converted.
+# Each CH folder produces Song (Expert).sloppak, Song (Hard).sloppak, etc.
+# Skipped only if ALL expected per-difficulty files already exist.
 ```
 
 **Default skip behaviour**: if a `.sloppak` output file already exists it is
@@ -144,10 +144,10 @@ drum highway, piano roll, or tab view).
 
 **Drum difficulties — two modes:**
 
-| Mode | Arrangement IDs | Behavior |
+| Mode | Output | Behavior |
 |---|---|---|
-| Default (slider) | `drums`, `drums_score` | One arrangement; difficulty slider spans all available levels |
-| `--split-drums` | `drums-expert`, `drums-hard`, `drums-medium`, `drums-easy` (present diffs only) + `drums_score-*` equivalents | Separate selectable arrangement per difficulty |
+| Default (slider) | One `.sloppak` with `drums` / `drums_score` | Difficulty slider spans all available levels |
+| `--split-drums` | One `.sloppak` per difficulty: `Song (Expert).sloppak`, `Song (Hard).sloppak`, … | Each file is a complete standalone package — all stems, cover, lyrics, and non-drum arrangements duplicated; drum arrangement inside each file uses standard `drums` / `drums_score` IDs |
 
 Keys and guitar/bass always use the slider mode regardless of `--split-drums`.
 
@@ -172,7 +172,7 @@ to avoid colliding with RS `lead` / `bass` arrangements.
 | `[Events]` lyric events / MIDI VOCALS track | `lyrics.json` |
 | `album.png` / `album.jpg` | `cover.<ext>` |
 | Drums track — default | `drum_tab_drums.json` |
-| Drums track — `--split-drums` | `drum_tab_drums-expert.json`, `drum_tab_drums-hard.json`, … |
+| Drums track — `--split-drums` | `drum_tab_drums.json` inside each per-difficulty `.sloppak` |
 
 ## Drum encoding (4-lane Pro)
 

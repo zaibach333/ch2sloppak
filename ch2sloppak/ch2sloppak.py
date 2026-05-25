@@ -124,7 +124,9 @@ def convert(song_dir, output_path=None, verbose=True, split_drums=False):
 
     # --- convert arrangements ---
     _diff_label = {3: "E", 2: "H", 1: "M", 0: "Ey"}
-    arrangements = {}
+    _diff_cap   = {3: "Expert", 2: "Hard", 1: "Medium", 0: "Easy"}
+    arrangements    = {}
+    drums_diff_dict = None
     for track_id, diff_dict in parsed["tracks"].items():
         if not diff_dict:
             continue
@@ -132,13 +134,11 @@ def convert(song_dir, output_path=None, verbose=True, split_drums=False):
         diff_label   = "/".join(_diff_label.get(d, str(d))
                                 for d in sorted(diff_dict.keys(), reverse=True))
         if track_id == "drums":
+            drums_diff_dict = diff_dict
             if split_drums:
-                new = {**arrangement_writer.convert_drums_per_diff(diff_dict),
-                       **arrangement_writer.convert_drums_score_per_diff(diff_dict)}
-                arrangements.update(new)
                 if verbose:
-                    ids = sorted(k for k in new if not k.startswith("drums_score"))
-                    print(f"  [drums] {total_notes} notes ({diff_label}) → {', '.join(ids)}")
+                    print(f"  [drums] {total_notes} notes ({diff_label}) "
+                          f"→ {len(diff_dict)} file(s)")
             else:
                 arr = arrangement_writer.convert_drums(diff_dict)
                 arrangements["drums"]       = arr
@@ -182,15 +182,12 @@ def convert(song_dir, output_path=None, verbose=True, split_drums=False):
     if verbose and lyrics_data:
         print(f"  lyrics: {len(lyrics_data)} syllables")
 
-    # --- drum_tabs (for slopsmith-plugin-drum-highway-3d) ---
+    # --- drum_tabs (non-split only; split path handles per-file below) ---
     drum_tabs = {}
-    if "drums" in parsed["tracks"] and parsed["tracks"]["drums"]:
-        if split_drums:
-            drum_tabs = drum_tab_writer.convert_per_diff(parsed["tracks"]["drums"])
-        else:
-            dt = drum_tab_writer.convert(parsed["tracks"]["drums"])
-            if dt:
-                drum_tabs["drums"] = dt
+    if not split_drums and "drums" in parsed["tracks"] and parsed["tracks"]["drums"]:
+        dt = drum_tab_writer.convert(parsed["tracks"]["drums"])
+        if dt:
+            drum_tabs["drums"] = dt
     if verbose and drum_tabs:
         total_hits = sum(len(t["hits"]) for t in drum_tabs.values())
         print(f"  drum_tab: {total_hits} hits")
@@ -201,7 +198,52 @@ def convert(song_dir, output_path=None, verbose=True, split_drums=False):
     cover_filename = ("cover" + os.path.splitext(cover_path)[1].lower()
                       if cover_path else None)
 
-    # --- build manifest ---
+    # --- split-drums: one file per difficulty ---
+    if split_drums and drums_diff_dict:
+        if output_path is None:
+            safe = re.sub(r'[<>:"/\\|?*]', "", f"{artist} - {title}" if artist else title)
+            safe = safe.strip(". ") or "output"
+            output_base = os.path.join(os.path.dirname(song_dir), safe)
+        else:
+            output_base = os.path.splitext(output_path)[0]
+
+        outputs = []
+        for diff, hits in sorted(drums_diff_dict.items(), reverse=True):
+            diff_name = _diff_cap.get(diff, str(diff))
+            diff_arrs = dict(arrangements)
+            diff_arrs["drums"]       = arrangement_writer.convert_drums({diff: hits})
+            diff_arrs["drums_score"] = arrangement_writer.convert_drums_score({diff: hits})
+            if beats_data:
+                diff_arrs["drums"]["beats"]       = beats_data
+                diff_arrs["drums_score"]["beats"] = beats_data
+            dt = drum_tab_writer.convert({diff: hits})
+            diff_drum_tabs = {"drums": dt} if dt else {}
+            diff_out = f"{output_base} ({diff_name}).sloppak"
+            diff_manifest = manifest_writer.build(
+                metadata={**metadata, "name": title, "artist": artist},
+                arrangement_ids=list(diff_arrs.keys()),
+                stem_ids=stem_ids,
+                cover_filename=cover_filename,
+                has_lyrics=bool(lyrics_data),
+                drum_tabs={"drums": "drum_tab_drums.json"} if diff_drum_tabs else {},
+            )
+            sloppak_writer.write(
+                output_path=diff_out,
+                manifest_yaml=manifest_writer.to_yaml_string(diff_manifest),
+                arrangements=diff_arrs,
+                lyrics_data=lyrics_data,
+                song_dir=song_dir,
+                cover_path=cover_path,
+                verbose=verbose,
+                drum_tabs=diff_drum_tabs,
+            )
+            if verbose:
+                size_kb = os.path.getsize(diff_out) // 1024
+                print(f"  → {diff_out}  ({size_kb} KB)")
+            outputs.append(diff_out)
+        return outputs
+
+    # --- build manifest (non-split) ---
     arrangement_drum_tabs = {
         aid: f"drum_tab_{aid}.json" for aid in drum_tabs
     }
@@ -325,7 +367,8 @@ def main():
                           output_path=args.output,
                           verbose=not args.quiet,
                           split_drums=args.split_drums)
-            print(f"Done: {out}")
+            for p in ([out] if isinstance(out, str) else out):
+                print(f"Done: {p}")
 
         elif args.command == "merge":
             out = merge_mod.merge(
@@ -337,7 +380,8 @@ def main():
                 verbose         = not args.quiet,
                 split_drums     = args.split_drums,
             )
-            print(f"Done: {out}")
+            for p in ([out] if isinstance(out, str) else out):
+                print(f"Done: {p}")
 
         elif args.command == "batch":
             batch_mod.run(
