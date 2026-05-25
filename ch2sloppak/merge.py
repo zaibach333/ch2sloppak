@@ -181,7 +181,7 @@ def _lyrics_align(raw_ch_lyrics, rs_lyrics, verbose):
 _COARSE_RATE       = 50     # Hz — onset envelope rate for all scoring
 _COARSE_SEARCH_S   = 30.0   # ±30 s initial search range
 _COARSE_ZERO_BIAS  = 1e-4   # per-lag penalty to prefer smaller offsets on ties
-_N_ALIGN_PASSES    = 80     # iterative note-to-audio passes
+_N_ALIGN_PASSES    = 5      # iterative note-to-audio passes
 _CH_BAND_SR        = 8000   # sample rate for CH drum extraction (Python IIR filtered)
 _CH_BAND_WIN       = _CH_BAND_SR // _COARSE_RATE  # 160 → 50 Hz envelope
 _AUDIO_AGREE_S     = 0.3    # max note/audio diff (s) to trust the audio result
@@ -1215,19 +1215,18 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
                 print("  align    : no signal found; zero offset applied")
 
     # --- convert CH arrangements ---
-    # Guitar/bass tracks are always written with "-gamepad" IDs so they never
-    # shadow RS arrangements and both can coexist in the merged package.
-    _GAMEPAD_IDS = {"lead": "lead-gamepad", "bass": "bass-gamepad"}
-
+    # Guitar/bass tracks always get "-gamepad" IDs; drums deferred in split mode.
+    _GAMEPAD_IDS    = {"lead": "lead-gamepad", "bass": "bass-gamepad"}
+    _DIFF_CAP       = {3: "Expert", 2: "Hard", 1: "Medium", 0: "Easy"}
     ch_arrangements = {}
+    drums_diff_dict_ch = None
+
     for track_id, diff_dict in parsed["tracks"].items():
         if not diff_dict:
             continue
         if track_id == "drums":
-            if split_drums:
-                ch_arrangements.update(arrangement_writer.convert_drums_per_diff(diff_dict))
-                ch_arrangements.update(arrangement_writer.convert_drums_score_per_diff(diff_dict))
-            else:
+            drums_diff_dict_ch = diff_dict
+            if not split_drums:
                 ch_arrangements["drums"]       = arrangement_writer.convert_drums(diff_dict)
                 ch_arrangements["drums_score"] = arrangement_writer.convert_drums_score(diff_dict)
         elif track_id == "keys":
@@ -1237,23 +1236,20 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
             ch_arrangements[out_id] = arrangement_writer.convert_guitar(
                 diff_dict, arrangement_name=out_id)
 
-    # --- drum_tabs (for slopsmith-plugin-drum-highway-3d) ---
+    # --- drum_tabs (non-split only; split path handles per-file below) ---
     drum_tabs = {}
-    if "drums" in parsed["tracks"] and parsed["tracks"]["drums"]:
-        if split_drums:
-            drum_tabs = drum_tab_writer.convert_per_diff(parsed["tracks"]["drums"])
-        else:
-            dt = drum_tab_writer.convert(parsed["tracks"]["drums"])
-            if dt:
-                drum_tabs["drums"] = dt
+    if not split_drums and "drums" in parsed["tracks"] and parsed["tracks"]["drums"]:
+        dt = drum_tab_writer.convert(parsed["tracks"]["drums"])
+        if dt:
+            drum_tabs["drums"] = dt
 
-    # Retime and stamp RS beats onto each CH arrangement
+    # Retime non-drum CH arrangements and stamp RS beats
     for arr in ch_arrangements.values():
         _retime_arrangement(arr, shift_fn)
         if rs["rs_beats"]:
             arr["beats"] = rs["rs_beats"]
 
-    # Retime drum_tab hits
+    # Retime drum_tab hits (non-split)
     for tab in drum_tabs.values():
         for hit in tab["hits"]:
             hit["t"] = round(shift_fn(hit["t"]), 3)
@@ -1262,7 +1258,93 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
         total_hits = sum(len(t["hits"]) for t in drum_tabs.values())
         print(f"  drum_tab : {total_hits} hits")
 
-    # --- merge: RS wins on ID collision ---
+    # --- lyrics: prefer RS; fall back to CH ---
+    lyrics_data = []
+    if not rs["has_lyrics"]:
+        raw = parsed.get("lyrics", [])
+        if raw:
+            lyrics_data = lyrics_writer.convert(raw)
+            if verbose and lyrics_data:
+                print(f"  lyrics   : {len(lyrics_data)} syllables (from CH)")
+
+    # --- split-drums: one merged file per difficulty ---
+    if split_drums and drums_diff_dict_ch:
+        if output_path:
+            output_base = os.path.splitext(output_path)[0]
+        else:
+            output_base = os.path.splitext(rs_sloppak_path)[0] + "+ch"
+
+        rs_meta = rs["manifest"]
+        outputs = []
+        for diff, hits in sorted(drums_diff_dict_ch.items(), reverse=True):
+            diff_name = _DIFF_CAP.get(diff, str(diff))
+            diff_out  = f"{output_base} ({diff_name}).sloppak"
+
+            drums_arr       = arrangement_writer.convert_drums({diff: hits})
+            drums_score_arr = arrangement_writer.convert_drums_score({diff: hits})
+            _retime_arrangement(drums_arr, shift_fn)
+            _retime_arrangement(drums_score_arr, shift_fn)
+            if rs["rs_beats"]:
+                drums_arr["beats"]       = rs["rs_beats"]
+                drums_score_arr["beats"] = rs["rs_beats"]
+
+            dt = drum_tab_writer.convert({diff: hits})
+            diff_drum_tabs = {}
+            if dt:
+                for hit in dt["hits"]:
+                    hit["t"] = round(shift_fn(hit["t"]), 3)
+                dt["hits"].sort(key=lambda h: h["t"])
+                diff_drum_tabs["drums"] = dt
+
+            diff_ch = dict(ch_arrangements)
+            diff_ch["drums"]       = drums_arr
+            diff_ch["drums_score"] = drums_score_arr
+
+            diff_merged = dict(rs["arrangements"])
+            diff_added, diff_skipped = [], []
+            for tid, arr in diff_ch.items():
+                if tid in diff_merged:
+                    diff_skipped.append(tid)
+                else:
+                    diff_merged[tid] = arr
+                    diff_added.append(tid)
+
+            if verbose:
+                if diff_added:
+                    print(f"  [{diff_name}] added   : {', '.join(diff_added)}")
+                if diff_skipped:
+                    print(f"  [{diff_name}] skipped : {', '.join(diff_skipped)} (RS exists)")
+
+            diff_manifest = manifest_writer.build(
+                metadata={
+                    "name":       rs_meta.get("title",  "Unknown"),
+                    "artist":     rs_meta.get("artist", ""),
+                    "album":      rs_meta.get("album",  ""),
+                    "year_clean": str(rs_meta.get("year", "")),
+                },
+                arrangement_ids = list(diff_merged.keys()),
+                stem_ids        = rs["stem_ids"],
+                cover_filename  = rs["cover_name"],
+                has_lyrics      = rs["has_lyrics"] or bool(lyrics_data),
+                rs_arrangements = rs_meta.get("arrangements", []),
+                drum_tabs       = {"drums": "drum_tab_drums.json"} if diff_drum_tabs else {},
+            )
+            _write_merged(
+                output_path         = diff_out,
+                manifest_yaml       = manifest_writer.to_yaml_string(diff_manifest),
+                merged_arrangements = diff_merged,
+                rs_sloppak_path     = rs_sloppak_path,
+                rs_data             = rs,
+                lyrics_data         = lyrics_data,
+                drum_tabs           = diff_drum_tabs,
+            )
+            if verbose:
+                size_kb = os.path.getsize(diff_out) // 1024
+                print(f"  → {diff_out}  ({size_kb} KB)")
+            outputs.append(diff_out)
+        return outputs
+
+    # --- merge (non-split): RS wins on ID collision ---
     merged = dict(rs["arrangements"])
     added, skipped = [], []
     for tid, arr in ch_arrangements.items():
@@ -1277,15 +1359,6 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
             print(f"  added    : {', '.join(added)}")
         if skipped:
             print(f"  skipped  : {', '.join(skipped)} (RS arrangement exists)")
-
-    # --- lyrics: prefer RS; fall back to CH ---
-    lyrics_data = []
-    if not rs["has_lyrics"]:
-        raw = parsed.get("lyrics", [])
-        if raw:
-            lyrics_data = lyrics_writer.convert(raw)
-            if verbose and lyrics_data:
-                print(f"  lyrics   : {len(lyrics_data)} syllables (from CH)")
 
     # --- manifest: use RS metadata ---
     rs_meta = rs["manifest"]

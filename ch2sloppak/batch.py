@@ -22,6 +22,7 @@ import yaml
 _GAMEPAD_IDS = {"lead": "lead-gamepad", "bass": "bass-gamepad"}
 
 _DIFF_NAMES = {3: "expert", 2: "hard", 1: "medium", 0: "easy"}
+_DIFF_CAPS  = {3: "Expert", 2: "Hard", 1: "Medium", 0: "Easy"}
 
 # Fuzzy match thresholds (SequenceMatcher ratio, 0–1).
 _FUZZY_COMBINED_THRESHOLD = 0.85   # artist+title sequence similarity
@@ -143,19 +144,14 @@ def predict_merge_ids(tracks_dict, split_drums=False):
     """
     Given a parsed tracks dict, return the arrangement IDs a merge would add.
     Mirrors merge.py track→arrangement mapping including gamepad renaming.
-    When split_drums=True, drums produce per-difficulty IDs like 'drums-expert'.
+    With split_drums, each file has standard 'drums'/'drums_score' IDs.
     """
     ids = []
     for track_id, diff_dict in tracks_dict.items():
         if not diff_dict:
             continue
         if track_id == "drums":
-            if split_drums:
-                for diff in diff_dict:
-                    name = _DIFF_NAMES.get(diff, str(diff))
-                    ids += [f"drums-{name}", f"drums_score-{name}"]
-            else:
-                ids += ["drums", "drums_score"]
+            ids += ["drums", "drums_score"]
         elif track_id == "keys":
             ids.append("keys")
         else:
@@ -303,59 +299,89 @@ def run(root_dir, output_dir=None, library_dir=None, force=False, verbose=True,
             if rs_path:
                 candidate_ids = predict_merge_ids(parsed["tracks"], split_drums=split_drums)
 
-                rs_base = re.sub(r'[<>:"/\\|?*]', "",
-                                 os.path.splitext(os.path.basename(rs_path))[0])
-                out_path = os.path.join(
-                    output_dir or os.path.dirname(rs_path),
-                    f"{rs_base}+ch.sloppak",
-                )
+                rs_base    = re.sub(r'[<>:"/\\|?*]', "",
+                                    os.path.splitext(os.path.basename(rs_path))[0])
+                out_dir    = output_dir or os.path.dirname(rs_path)
+                drums_track = parsed["tracks"].get("drums", {})
+                use_split   = split_drums and bool(drums_track)
 
-                # Decide what to check for missing tracks:
-                #   • If a genuine +ch output already exists, inspect it — it
-                #     may have been partially merged and could be missing tracks.
-                #   • If the file at out_path exists but is NOT a +ch file
-                #     (naming collision or leftover standalone convert), ignore
-                #     it and check the RS source instead — merge should still run.
-                #   • Otherwise check the RS source.
-                out_basename = os.path.basename(out_path)
-                if not force and os.path.exists(out_path) and "+ch" in out_basename:
-                    existing_manifest = _read_sloppak_manifest(out_path)
-                    check_manifest = existing_manifest or rs_manifest
-                    check_name = out_basename
+                if use_split:
+                    diffs     = sorted(drums_track.keys(), reverse=True)
+                    out_paths = [
+                        os.path.join(out_dir,
+                                     f"{rs_base}+ch ({_DIFF_CAPS.get(d, str(d))}).sloppak")
+                        for d in diffs
+                    ]
+                    out_path  = out_paths[0]
+
+                    if not force and all(os.path.exists(p) for p in out_paths):
+                        reason = "all split files already exist"
+                        if verbose:
+                            print(f"  SKIP: {reason}")
+                        skipped_entries.append({"artist": artist, "title": title,
+                                                "ch_dir": ch_dir,
+                                                "output": ", ".join(out_paths),
+                                                "reason": reason})
+                        skipped += 1
+                        continue
+                    missing = candidate_ids   # all tracks are new per-file
                 else:
-                    check_manifest = rs_manifest
-                    check_name = os.path.basename(rs_path)
+                    out_path = os.path.join(out_dir, f"{rs_base}+ch.sloppak")
+                    out_paths = [out_path]
 
-                missing = missing_from_manifest(check_manifest, candidate_ids)
+                    # Check for missing tracks in the manifest
+                    out_basename = os.path.basename(out_path)
+                    if not force and os.path.exists(out_path) and "+ch" in out_basename:
+                        existing_manifest = _read_sloppak_manifest(out_path)
+                        check_manifest = existing_manifest or rs_manifest
+                        check_name = out_basename
+                    else:
+                        check_manifest = rs_manifest
+                        check_name = os.path.basename(rs_path)
 
-                if not missing:
-                    reason = f"all CH tracks already present in {check_name}"
-                    if verbose:
-                        print(f"  SKIP: {reason}")
-                    skipped_entries.append({"artist": artist, "title": title,
-                                            "ch_dir": ch_dir, "output": out_path,
-                                            "reason": reason})
-                    skipped += 1
-                    continue
+                    missing = missing_from_manifest(check_manifest, candidate_ids)
+
+                    if not missing:
+                        reason = f"all CH tracks already present in {check_name}"
+                        if verbose:
+                            print(f"  SKIP: {reason}")
+                        skipped_entries.append({"artist": artist, "title": title,
+                                                "ch_dir": ch_dir, "output": out_path,
+                                                "reason": reason})
+                        skipped += 1
+                        continue
 
                 if verbose:
-                    action = ("Re-merging"
-                              if os.path.exists(out_path) and "+ch" in out_basename
-                              else "Merging")
+                    if use_split:
+                        action = ("Re-merging"
+                                  if any(os.path.exists(p) for p in out_paths)
+                                  else "Merging")
+                    else:
+                        out_basename = os.path.basename(out_path)
+                        action = ("Re-merging"
+                                  if os.path.exists(out_path) and "+ch" in out_basename
+                                  else "Merging")
                     print(f"  {action} with {os.path.basename(rs_path)}")
                     print(f"  Adding: {', '.join(missing)}")
 
+                # For split mode, pass a base output_path so merge() can derive
+                # per-diff filenames; for non-split pass out_path directly.
+                merge_out_path = (
+                    os.path.join(out_dir, f"{rs_base}+ch.sloppak")
+                    if use_split else out_path
+                )
                 out = merge_mod.merge(
                     ch_dir=ch_dir,
                     rs_sloppak_path=rs_path,
-                    output_path=out_path,
+                    output_path=merge_out_path,
                     verbose=verbose,
                     split_drums=split_drums,
                 )
+                out_str = ", ".join(out) if isinstance(out, list) else out
                 merge_entries.append({
                     "artist": artist, "title": title,
                     "ch_dir": ch_dir, "rs_path": rs_path,
-                    "added_tracks": missing, "output": out,
+                    "added_tracks": missing, "output": out_str,
                 })
                 merged += 1
 
@@ -364,24 +390,45 @@ def run(root_dir, output_dir=None, library_dir=None, force=False, verbose=True,
                 safe = re.sub(r'[<>:"/\\|?*]', "",
                               f"{artist} - {title}" if artist else title)
                 safe = safe.strip(". ") or "output"
-                if output_dir:
-                    out_path = os.path.join(output_dir, f"{safe}.sloppak")
+                base_dir     = output_dir or os.path.dirname(ch_dir)
+                drums_track  = parsed["tracks"].get("drums", {})
+                use_split    = split_drums and bool(drums_track)
+
+                if use_split:
+                    diffs     = sorted(drums_track.keys(), reverse=True)
+                    out_paths = [
+                        os.path.join(base_dir,
+                                     f"{safe} ({_DIFF_CAPS.get(d, str(d))}).sloppak")
+                        for d in diffs
+                    ]
+                    out_path  = out_paths[0]
+                    if not force and all(os.path.exists(p) for p in out_paths):
+                        reason = "all split files already exist"
+                        if verbose:
+                            print(f"  SKIP: {reason}")
+                        skipped_entries.append({"artist": artist, "title": title,
+                                                "ch_dir": ch_dir,
+                                                "output": ", ".join(out_paths),
+                                                "reason": reason})
+                        skipped += 1
+                        continue
+                    # Pass base path; convert() strips ext and appends " (Diff)"
+                    conv_out_path = os.path.join(base_dir, f"{safe}.sloppak")
                 else:
-                    out_path = os.path.join(os.path.dirname(ch_dir),
-                                            f"{safe}.sloppak")
+                    out_path      = os.path.join(base_dir, f"{safe}.sloppak")
+                    conv_out_path = out_path
+                    if not force and os.path.exists(out_path):
+                        reason = f"output already exists: {out_path}"
+                        if verbose:
+                            print(f"  SKIP: {reason}")
+                        skipped_entries.append({"artist": artist, "title": title,
+                                                "ch_dir": ch_dir, "output": out_path,
+                                                "reason": reason})
+                        skipped += 1
+                        continue
 
-                if not force and os.path.exists(out_path):
-                    reason = f"output already exists: {out_path}"
-                    if verbose:
-                        print(f"  SKIP: {reason}")
-                    skipped_entries.append({"artist": artist, "title": title,
-                                            "ch_dir": ch_dir, "output": out_path,
-                                            "reason": reason})
-                    skipped += 1
-                    continue
-
-                main_mod.convert(song_dir=ch_dir, output_path=out_path, verbose=verbose,
-                                 split_drums=split_drums)
+                main_mod.convert(song_dir=ch_dir, output_path=conv_out_path,
+                                 verbose=verbose, split_drums=split_drums)
                 converted += 1
 
         except Exception as exc:
