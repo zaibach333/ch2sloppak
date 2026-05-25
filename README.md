@@ -50,21 +50,24 @@ python ch2sloppak.py merge <ch-folder> <rs.sloppak> --split-drums
 
 The merge command auto-aligns CH note timing to the RS audio in three stages:
 
-1. **80-pass iterative banded note-to-audio** — when a drum chart is present,
-   the RS stem is filtered into three frequency bands (kick <150 Hz,
-   snare 150–2500 Hz, cymbal >2500 Hz). Each CH drum note type is scored only
-   against its matching band, making a wrong-beat offset produce a genuinely
-   different score rather than just a timing shift. The search window decays
-   exponentially from ±30 s to ±1 frame over 80 passes; each pass applies the
-   found correction and rescores from the new position, converging to the true
-   beat from any starting point.
-2. **Banded CH-audio refinement** — if CH drum stems are present, they are
-   summed and split into the same three bands via IIR filters, then
-   cross-correlated per-band against the RS bands within ±0.9 s of the
-   note-derived estimate. If all three bands agree within 0.3 s the audio
-   result replaces the note estimate for sub-frame accuracy; otherwise the
-   note-derived offset is kept. Falls back to full-song onset-envelope
-   cross-correlation when no drum chart is available at all.
+1. **80-pass iterative frequency-adaptive note-to-audio** — when a drum chart
+   is present, the RS stem is filtered into three frequency bands (kick <150 Hz,
+   snare 150–2500 Hz, cymbal >2500 Hz). If CH drum stems are available, a
+   per-type frequency fingerprint is built by searching a ±400 ms window around
+   each note's chart time and averaging the peak band energies across all notes
+   of that type. Aggregating over the whole song makes the fingerprint robust to
+   intro/outro length differences and timing drift between CH audio and chart.
+   Each note is then scored against RS using its type's learned weight vector
+   rather than a fixed frequency assumption. Notes with simultaneous hits within
+   20 ms are down-weighted by 1/(n_nearby+1). Without CH audio, weights fall
+   back to one-hot on the declared band type. The search window decays
+   exponentially from ±30 s to ±1 frame over 80 passes.
+2. **Banded CH-audio xcorr refinement** — if CH drum stems are present, they
+   are cross-correlated per-band against the RS bands within ±0.9 s of the
+   note-derived estimate. If the result agrees within 0.3 s it replaces the
+   note estimate for sub-frame accuracy; otherwise the note-derived offset is
+   kept. Falls back to full-song onset-envelope cross-correlation when no drum
+   chart is available at all.
 3. **Beat IBI** — piecewise beat-map cross-correlation handles residual tempo
    stretch within the aligned window.
 

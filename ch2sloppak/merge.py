@@ -158,32 +158,34 @@ def _lyrics_align(raw_ch_lyrics, rs_lyrics, verbose):
 # ---------------------------------------------------------------------------
 #
 # Primary path (drum chart available):
-#   Step 1 — 80-pass iterative banded note-to-audio.
+#   Step 1 — 80-pass iterative frequency-adaptive note-to-audio.
 #     RS stem is filtered into three bands (kick <150 Hz, snare 150–2500 Hz,
-#     cymbal >2500 Hz).  Each CH drum note type is scored against its matching
-#     band only — kicks vs low energy, snares vs mid, cymbals vs high.  The
-#     search window decays exponentially from ±30 s down to ±1 frame over 80
-#     passes, applying the correction each time and re-scoring from the new
-#     position, converging to the true beat from any starting point.
+#     cymbal >2500 Hz).  When CH drum stems are present, each note's frequency
+#     fingerprint is read directly from the CH band envelopes at that note's
+#     chart time — no fixed "kick=low" assumption.  The fingerprint is
+#     normalised to a weight vector (wkick, wsnare, wcymbal) and used as a soft
+#     blend when scoring that note against each RS position.  Simultaneous hits
+#     (within 20 ms) are down-weighted by 1/(n_nearby+1) since co-occurring
+#     drums blur the fingerprint.  Without CH audio, weights fall back to
+#     one-hot on the declared band.  Search window decays exponentially from
+#     ±30 s to ±1 frame over 80 passes.
 #   Step 2 — banded CH-audio vs RS-audio xcorr refinement (if CH drums exist).
-#     CH drum stems are extracted and Python-IIR-filtered into the same three
-#     bands, then cross-correlated per-band against the RS bands within ±2 s of
-#     the note-derived estimate.  If the audio result agrees within 0.3 s it
-#     replaces the note estimate (finer sub-frame accuracy); otherwise the
-#     note-derived offset is kept.
+#     Cross-correlates CH drum bands vs RS bands within ±0.9 s of the note-
+#     derived estimate for sub-frame accuracy; accepted if within 0.3 s.
 #
 # Fallback path (no drum chart): full-song onset xcorr + multi-clip voting.
 #
 # Sign convention: lag > 0 means CH appears lag frames LATER than RS,
 # so offset_s = -lag / rate (what to ADD to CH note times to reach RS time).
 
-_COARSE_RATE     = 50     # Hz — onset envelope rate for all scoring
-_COARSE_SEARCH_S = 30.0   # ±30 s initial search range
-_COARSE_ZERO_BIAS = 1e-4  # per-lag penalty to prefer smaller offsets on ties
-_N_ALIGN_PASSES  = 80     # iterative note-to-audio passes
-_CH_BAND_SR      = 8000   # sample rate for CH drum extraction (Python IIR filtered)
-_CH_BAND_WIN     = _CH_BAND_SR // _COARSE_RATE  # 160 → 50 Hz envelope
-_AUDIO_AGREE_S   = 0.3    # max note/audio diff (s) to trust the audio result
+_COARSE_RATE       = 50     # Hz — onset envelope rate for all scoring
+_COARSE_SEARCH_S   = 30.0   # ±30 s initial search range
+_COARSE_ZERO_BIAS  = 1e-4   # per-lag penalty to prefer smaller offsets on ties
+_N_ALIGN_PASSES    = 80     # iterative note-to-audio passes
+_CH_BAND_SR        = 8000   # sample rate for CH drum extraction (Python IIR filtered)
+_CH_BAND_WIN       = _CH_BAND_SR // _COARSE_RATE  # 160 → 50 Hz envelope
+_AUDIO_AGREE_S     = 0.3    # max note/audio diff (s) to trust the audio result
+_PROFILE_WIN_FRAMES = 20    # ±20 frames = ±400 ms window for CH type-profile peaks
 
 # RS frequency band extraction: ffmpeg filters, SR/win = _COARSE_RATE
 _BAND_CFG = {
@@ -409,7 +411,7 @@ def _extract_band_envs(audio_path):
 
 
 def _drum_hits_to_band_pairs(hits, time_offset_s=0.0):
-    """Convert parsed drum hits to [(time_s, band), ...] sorted by time."""
+    """Convert parsed drum hits to [(time_s, declared_band), ...] sorted by time."""
     pairs = []
     for h in hits:
         t    = h["time_ms"] / 1000.0 + time_offset_s
@@ -417,6 +419,99 @@ def _drum_hits_to_band_pairs(hits, time_offset_s=0.0):
         pairs.append((t, band))
     pairs.sort()
     return pairs
+
+
+def _one_hot_weights(band):
+    """One-hot (wkick, wsnare, wcymbal) tuple for a declared band name."""
+    return {"kick": (1.0, 0.0, 0.0),
+            "snare": (0.0, 1.0, 0.0),
+            "cymbal": (0.0, 0.0, 1.0)}.get(band, (0.0, 1.0, 0.0))
+
+
+def _build_type_profiles(note_band_pairs, ch_band_envs, coarse_rate):
+    """Build per-declared-type frequency profiles from CH band envelopes.
+
+    CH audio timing does not match chart-note timing exactly — intro/outro
+    lengths differ, ch_audio_delay_s may be approximate, and minor tempo drift
+    accumulates.  Looking up a single frame per note is therefore unreliable.
+
+    Instead, for each note type (kick/snare/cymbal) this function searches in
+    a ±_PROFILE_WIN_FRAMES window around each note's chart time and takes the
+    peak in each band, then averages across all notes of that type.  Aggregating
+    over many hits smooths out individual timing errors and produces a stable
+    per-type fingerprint: "what does a kick/snare/cymbal actually sound like in
+    this recording?"
+
+    Returns {declared_band: (wkick, wsnare, wcymbal)}, or None on failure.
+    """
+    if not ch_band_envs:
+        return None
+
+    n_ch = len(ch_band_envs["kick"])
+    ck, cs, cc = ch_band_envs["kick"], ch_band_envs["snare"], ch_band_envs["cymbal"]
+    w    = _PROFILE_WIN_FRAMES
+
+    accum = {"kick": [0.0, 0.0, 0.0], "snare": [0.0, 0.0, 0.0], "cymbal": [0.0, 0.0, 0.0]}
+    count = {"kick": 0, "snare": 0, "cymbal": 0}
+
+    for t, declared_band in note_band_pairs:
+        if declared_band not in accum:
+            continue
+        f  = round(t * coarse_rate)
+        lo = max(0, f - w)
+        hi = min(n_ch, f + w + 1)
+        if lo >= hi:
+            continue
+        accum[declared_band][0] += max(ck[lo:hi])
+        accum[declared_band][1] += max(cs[lo:hi])
+        accum[declared_band][2] += max(cc[lo:hi])
+        count[declared_band]    += 1
+
+    profiles = {}
+    for band in ("kick", "snare", "cymbal"):
+        n = count[band]
+        if n == 0:
+            profiles[band] = _one_hot_weights(band)
+            continue
+        a = accum[band]
+        avg_k, avg_s, avg_c = a[0] / n, a[1] / n, a[2] / n
+        total = avg_k + avg_s + avg_c
+        profiles[band] = ((avg_k / total, avg_s / total, avg_c / total)
+                          if total > 1e-10 else _one_hot_weights(band))
+    return profiles
+
+
+def _prep_note_weights(note_band_pairs, ch_band_envs, coarse_rate,
+                        simultaneous_ms=20.0):
+    """Compute per-note frequency weight tuples.
+
+    Assigns each note its type's aggregate frequency profile (from
+    _build_type_profiles), so weights are stable across the song even when
+    CH audio timing drifts from chart timing.  Falls back to one-hot weights
+    when no CH audio is available.
+
+    Notes with simultaneous hits within ±simultaneous_ms are down-weighted by
+    1/(n_nearby+1) since co-occurring drums blur the frequency fingerprint.
+
+    Returns [(orig_frame, (wkick, wsnare, wcymbal), sim_weight), ...].
+    """
+    type_profiles = _build_type_profiles(note_band_pairs, ch_band_envs, coarse_rate)
+
+    times = [t for t, _ in note_band_pairs]
+    sim_s = simultaneous_ms / 1000.0
+
+    result = []
+    for i, (t, declared_band) in enumerate(note_band_pairs):
+        n_nearby = sum(1 for j, t2 in enumerate(times)
+                       if j != i and abs(t2 - t) <= sim_s)
+        sim_w   = 1.0 / (n_nearby + 1)
+        frame   = round(t * coarse_rate)
+        weights = (type_profiles[declared_band]
+                   if type_profiles and declared_band in type_profiles
+                   else _one_hot_weights(declared_band))
+        result.append((frame, weights, sim_w))
+
+    return result
 
 
 import math as _math
@@ -471,32 +566,33 @@ def _extract_band_envs_paths(paths):
     return {b: v[:min_len] for b, v in result.items()}
 
 
-def _note_align_iterative(note_band_pairs, band_envs, coarse_rate,
+def _note_align_iterative(note_frame_weights, band_envs_rs, coarse_rate,
                            max_search_s=30.0, n_passes=80, zero_bias=1e-4):
     """Iteratively refine note-to-audio offset over n_passes.
 
-    Search window decays exponentially from ±max_search_s to ±1 frame over
-    n_passes.  Each pass applies the current offset to note positions, finds
-    the best correction within the window, and updates.  Convergence (lag=0)
-    terminates early; the window guarantees we can escape wrong-beat local
-    maxima before zooming in.
+    Frequency weights are pre-computed once; each pass applies the current
+    frame shift, scores against RS bands, and corrects.  Search window decays
+    exponentially from ±max_search_s to ±1 frame.  Terminates early on lag=0.
 
     Returns (offset_s, final_score, passes_taken).
     """
     start_lag = max(1, int(max_search_s * coarse_rate))
     min_lag   = 1
     decay     = (min_lag / start_lag) ** (1.0 / max(n_passes - 1, 1))
+    n_rs      = len(next(iter(band_envs_rs.values()))) if band_envs_rs else 0
 
-    offset      = 0.0
-    score       = 0.0
+    offset       = 0.0
+    score        = 0.0
     passes_taken = n_passes
 
     for i in range(n_passes):
-        max_lag = max(min_lag, int(start_lag * decay ** i))
-        shifted = [(t + offset, b) for t, b in note_band_pairs]
-        lag, score = _note_onset_align_banded(shifted, band_envs, coarse_rate,
-                                               max_lag, zero_bias=zero_bias)
-        offset += -lag / coarse_rate
+        max_lag     = max(min_lag, int(start_lag * decay ** i))
+        frame_shift = round(offset * coarse_rate)
+        shifted     = [(f + frame_shift, bw, sw)
+                       for f, bw, sw in note_frame_weights]
+        lag, score  = _score_banded(shifted, band_envs_rs, n_rs,
+                                     max_lag, zero_bias=zero_bias)
+        offset     += -lag / coarse_rate
         if lag == 0:
             passes_taken = i + 1
             break
@@ -540,33 +636,38 @@ def _banded_xcorr_fine(band_envs_ch, band_envs_rs, coarse_rate,
     return sum(o * c for o, c in results) / total_w
 
 
-def _note_onset_align_banded(note_band_pairs, band_envs, coarse_rate, max_lag,
-                              zero_bias=0.0):
-    """Score each candidate lag using frequency-band-matched note-to-audio scoring.
+def _score_banded(note_frame_weights, rs_band_envs, n_rs, max_lag,
+                   zero_bias=0.0):
+    """Score each candidate lag using adaptive per-note frequency weights.
 
-    Each drum note is scored against the onset envelope of its expected band:
-    kicks against low-band energy, snares/toms against mid, cymbals against high.
-    At a wrong offset, notes land on the wrong band's energy or silence, collapsing
-    the score even when total onset density looks similar to the correct offset.
+    Each note contributes a weighted blend of RS band energies at the candidate
+    position, scaled by its simultaneity weight.  The blend weights come from
+    CH audio fingerprints (or one-hot fallback), so the score collapses when
+    notes land on the wrong energy without hard-coding any drum-to-band mapping.
 
     Returns (best_lag, best_avg_score).  Sign: offset_s = -lag / coarse_rate.
     """
-    note_frames = [(round(t * coarse_rate), band) for t, band in note_band_pairs]
-    n_rs = len(next(iter(band_envs.values()))) if band_envs else 0
-    fallback = band_envs.get("snare", next(iter(band_envs.values()), []))
+    rs_kick   = rs_band_envs.get("kick",   [])
+    rs_snare  = rs_band_envs.get("snare",  [])
+    rs_cymbal = rs_band_envs.get("cymbal", [])
 
     best_lag, best_score = 0, float("-inf")
     for lag in range(-max_lag, max_lag + 1):
-        score = 0.0
-        count = 0
-        for f, band in note_frames:
-            idx = f - lag
+        score   = 0.0
+        total_w = 0.0
+        count   = 0
+        for frame, (wk, ws, wc), sim_w in note_frame_weights:
+            idx = frame - lag
             if 0 <= idx < n_rs:
-                score += band_envs.get(band, fallback)[idx]
-                count += 1
+                note_sc  = (wk * rs_kick[idx]
+                            + ws * rs_snare[idx]
+                            + wc * rs_cymbal[idx])
+                score   += note_sc * sim_w
+                total_w += sim_w
+                count   += 1
         if count < 10:
             continue
-        avg = score / count - zero_bias * abs(lag)
+        avg = score / total_w - zero_bias * abs(lag)
         if avg > best_score:
             best_score = avg
             best_lag   = lag
@@ -603,9 +704,35 @@ def _audio_align(ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs=None):
         max_lag = int(_COARSE_SEARCH_S * _COARSE_RATE)
 
         if ch_note_band_pairs:
-            # --- 80-pass iterative banded note-to-audio ---
+            # --- Extract CH drum audio bands early for adaptive note weights ---
+            ch_drum_files = _find_ch_drum_files(ch_dir)
+            band_envs_ch  = None
+            if ch_drum_files:
+                if verbose:
+                    ch_label = (f"drums ({len(ch_drum_files)} stem"
+                                f"{'s' if len(ch_drum_files) > 1 else ''})")
+                    print(f"  audio    : extracting CH {ch_label} frequency profile …")
+                band_envs_ch = _extract_band_envs_paths(ch_drum_files)
+
+            # Pre-compute per-note frequency weight tuples.
+            # When CH audio available: builds per-type aggregate profiles with
+            # ±400 ms windowed peak search, robust to intro/outro timing drift.
+            note_frame_weights = _prep_note_weights(
+                ch_note_band_pairs, band_envs_ch, _COARSE_RATE)
+            if verbose and band_envs_ch:
+                profiles = _build_type_profiles(
+                    ch_note_band_pairs, band_envs_ch, _COARSE_RATE)
+                if profiles:
+                    def _pct(w): return f"k{w[0]:.0%}/s{w[1]:.0%}/c{w[2]:.0%}"
+                    print(f"  audio    : type profiles — "
+                          f"kick={_pct(profiles['kick'])}  "
+                          f"snare={_pct(profiles['snare'])}  "
+                          f"cymbal={_pct(profiles['cymbal'])}")
+
+            # --- 80-pass iterative frequency-adaptive note-to-audio ---
+            mode_label = "adaptive" if band_envs_ch else "fixed-band"
             if verbose:
-                print(f"  audio    : note→audio (banded, {_N_ALIGN_PASSES} passes) "
+                print(f"  audio    : note→audio ({mode_label}, {_N_ALIGN_PASSES} passes) "
                       f"vs RS {rs_label} …")
             band_envs_rs = _extract_band_envs(rs_tmp)
             if not band_envs_rs:
@@ -615,38 +742,32 @@ def _audio_align(ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs=None):
 
             rs_dur_s = len(next(iter(band_envs_rs.values()))) / _COARSE_RATE
             offset_n, score_n, n_iters = _note_align_iterative(
-                ch_note_band_pairs, band_envs_rs, _COARSE_RATE,
+                note_frame_weights, band_envs_rs, _COARSE_RATE,
                 max_search_s=_COARSE_SEARCH_S, n_passes=_N_ALIGN_PASSES,
                 zero_bias=_COARSE_ZERO_BIAS)
             if verbose:
                 print(f"  audio    : note→audio  {offset_n:+.3f}s  "
                       f"(score {score_n:.4f}, {n_iters}/{_N_ALIGN_PASSES} passes, "
-                      f"{len(ch_note_band_pairs)} hits, RS={rs_dur_s:.0f}s)")
+                      f"{len(ch_note_band_pairs)} hits [{mode_label}], RS={rs_dur_s:.0f}s)")
 
             # --- Banded CH-audio vs RS-audio xcorr fine-tuning ---
             total_s = offset_n
-            ch_drum_files = _find_ch_drum_files(ch_dir)
-            if ch_drum_files:
+            if band_envs_ch:
                 if verbose:
-                    ch_label = (f"drums ({len(ch_drum_files)} stem"
-                                f"{'s' if len(ch_drum_files) > 1 else ''})")
-                    print(f"  audio    : CH {ch_label} banded xcorr "
-                          f"within ±{_AUDIO_AGREE_S*3:.1f}s …")
-                band_envs_ch = _extract_band_envs_paths(ch_drum_files)
-                if band_envs_ch:
-                    offset_a = _banded_xcorr_fine(
-                        band_envs_ch, band_envs_rs, _COARSE_RATE,
-                        anchor_s=offset_n, window_s=_AUDIO_AGREE_S * 3)
-                    diff = abs(offset_a - offset_n)
-                    if diff < _AUDIO_AGREE_S:
-                        total_s = offset_a
-                        if verbose:
-                            print(f"  audio    : audio xcorr {offset_a:+.3f}s  "
-                                  f"(diff {diff:.3f}s ≤ {_AUDIO_AGREE_S}s) → using audio")
-                    else:
-                        if verbose:
-                            print(f"  audio    : audio xcorr {offset_a:+.3f}s  "
-                                  f"(diff {diff:.3f}s > {_AUDIO_AGREE_S}s) → keeping notes")
+                    print(f"  audio    : banded xcorr within ±{_AUDIO_AGREE_S*3:.1f}s …")
+                offset_a = _banded_xcorr_fine(
+                    band_envs_ch, band_envs_rs, _COARSE_RATE,
+                    anchor_s=offset_n, window_s=_AUDIO_AGREE_S * 3)
+                diff = abs(offset_a - offset_n)
+                if diff < _AUDIO_AGREE_S:
+                    total_s = offset_a
+                    if verbose:
+                        print(f"  audio    : audio xcorr {offset_a:+.3f}s  "
+                              f"(diff {diff:.3f}s ≤ {_AUDIO_AGREE_S}s) → using audio")
+                else:
+                    if verbose:
+                        print(f"  audio    : audio xcorr {offset_a:+.3f}s  "
+                              f"(diff {diff:.3f}s > {_AUDIO_AGREE_S}s) → keeping notes")
 
             return total_s, True
 
