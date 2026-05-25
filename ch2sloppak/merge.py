@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 import yaml
@@ -149,8 +150,14 @@ def _lyrics_align(raw_ch_lyrics, rs_lyrics, verbose):
     if verbose:
         print(f"  lyrics   : {len(inliers)}/{len(offsets)} matches → offset {offset_s:+.3f} s")
 
-    # Require at least 4 inliers to trust the result
-    return offset_s if len(inliers) >= 4 else None
+    # Require at least 10 inliers AND ≥2% of RS lyrics matched to trust the result.
+    # A small absolute count is easily hit by chance in large RS lyric sets.
+    min_inliers = max(10, int(0.02 * len(rs_lyrics)))
+    if len(inliers) < min_inliers:
+        if verbose:
+            print(f"  lyrics   : rejected (need {min_inliers}, got {len(inliers)})")
+        return None
+    return offset_s
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +188,7 @@ def _lyrics_align(raw_ch_lyrics, rs_lyrics, verbose):
 _COARSE_RATE       = 50     # Hz — onset envelope rate for all scoring
 _COARSE_SEARCH_S   = 30.0   # ±30 s initial search range
 _COARSE_ZERO_BIAS  = 1e-4   # per-lag penalty to prefer smaller offsets on ties
-_N_ALIGN_PASSES    = 5      # iterative note-to-audio passes
+_N_ALIGN_PASSES    = 3      # iterative note-to-audio passes
 _CH_BAND_SR        = 8000   # sample rate for CH drum extraction (Python IIR filtered)
 _CH_BAND_WIN       = _CH_BAND_SR // _COARSE_RATE  # 160 → 50 Hz envelope
 _AUDIO_AGREE_S     = 0.3    # max note/audio diff (s) to trust the audio result
@@ -601,13 +608,13 @@ def _note_align_iterative(note_frame_weights, band_envs_rs, coarse_rate,
 
 
 def _banded_xcorr_fine(band_envs_ch, band_envs_rs, coarse_rate,
-                        anchor_s, window_s=2.0):
+                        anchor_s=None, window_s=2.0):
     """Per-band xcorr (CH vs RS) within ±window_s of anchor_s.
 
-    For each band, xcorr the full envelopes restricted to lags near anchor_s.
-    Returns the correlation-weighted mean offset, or anchor_s on failure.
+    anchor_s=None searches the full ±window_s range from lag=0 (use for coarse search).
+    Returns the correlation-weighted mean offset, or anchor_s (or 0) on failure.
     """
-    anchor_lag = -round(anchor_s * coarse_rate)
+    anchor_lag = 0 if anchor_s is None else -round(anchor_s * coarse_rate)
     fine_max   = max(1, int(window_s * coarse_rate))
 
     results = []
@@ -631,7 +638,7 @@ def _banded_xcorr_fine(band_envs_ch, band_envs_rs, coarse_rate,
         results.append((-best_lag / coarse_rate, max(0.0, best_corr)))
 
     if not results:
-        return anchor_s
+        return anchor_s if anchor_s is not None else 0.0
     total_w = sum(c for _, c in results) or 1e-10
     return sum(o * c for o, c in results) / total_w
 
@@ -675,15 +682,12 @@ def _score_banded(note_frame_weights, rs_band_envs, n_rs, max_lag,
 
 
 def _audio_align(ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs=None):
-    """Banded two-pass note-to-audio alignment (primary) or onset xcorr (fallback).
+    """Audio-based alignment.  Priority order:
 
-    Primary path (drum chart available):
-      Extracts the RS stem into three frequency bands (kick/snare/cymbal) and
-      scores each candidate offset by matching note types to their expected band.
-      Pass 1 searches ±30 s; pass 2 applies that offset and re-checks ±2 s.
-      No CH audio is required — only RS audio and chart note data.
-
-    Fallback path (no drum chart): full-song onset xcorr + multi-clip voting.
+      1. CH drum audio present → full-range banded xcorr (CH vs RS).
+         Notes are already in sync with CH audio; xcorr gives the direct offset.
+      2. Drum chart only, no CH audio → iterative note-to-audio scoring.
+      3. No drum chart → onset xcorr + multi-clip voting.
 
     Returns (offset_seconds, drum_anchor: bool) or (None, False) on failure.
     """
@@ -704,72 +708,82 @@ def _audio_align(ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs=None):
         max_lag = int(_COARSE_SEARCH_S * _COARSE_RATE)
 
         if ch_note_band_pairs:
-            # --- Extract CH drum audio bands early for adaptive note weights ---
+            t0_total = time.time()
             ch_drum_files = _find_ch_drum_files(ch_dir)
-            band_envs_ch  = None
+
             if ch_drum_files:
+                # --- Path 1: CH audio xcorr (primary) ---
+                # Notes are already timed to CH audio; xcorr gives the direct CH→RS offset.
+                ch_label = (f"drums ({len(ch_drum_files)} stem"
+                            f"{'s' if len(ch_drum_files) > 1 else ''})")
                 if verbose:
-                    ch_label = (f"drums ({len(ch_drum_files)} stem"
-                                f"{'s' if len(ch_drum_files) > 1 else ''})")
-                    print(f"  audio    : extracting CH {ch_label} frequency profile …")
+                    print(f"  audio    : extracting CH {ch_label} bands …",
+                          end=" ", flush=True)
+                t0 = time.time()
                 band_envs_ch = _extract_band_envs_paths(ch_drum_files)
+                if verbose:
+                    print(f"({time.time()-t0:.1f}s)")
 
-            # Pre-compute per-note frequency weight tuples.
-            # When CH audio available: builds per-type aggregate profiles with
-            # ±400 ms windowed peak search, robust to intro/outro timing drift.
+                if verbose:
+                    print(f"  audio    : extracting RS {rs_label} bands …",
+                          end=" ", flush=True)
+                t0 = time.time()
+                band_envs_rs = _extract_band_envs(rs_tmp)
+                if not band_envs_rs:
+                    if verbose:
+                        print("failed")
+                    return None, False
+                if verbose:
+                    print(f"({time.time()-t0:.1f}s)")
+
+                if verbose:
+                    print(f"  audio    : banded xcorr ±{_COARSE_SEARCH_S:.0f}s …",
+                          end=" ", flush=True)
+                t0 = time.time()
+                offset_a = _banded_xcorr_fine(
+                    band_envs_ch, band_envs_rs, _COARSE_RATE,
+                    anchor_s=None, window_s=_COARSE_SEARCH_S)
+                if verbose:
+                    print(f"({time.time()-t0:.1f}s)")
+                    print(f"  audio    : xcorr {offset_a:+.3f}s  "
+                          f"[{ch_label} → {rs_label}]")
+                    print(f"  audio    : alignment total {time.time()-t0_total:.1f}s")
+                return offset_a, True
+
+            # --- Path 2: no CH audio → note-to-audio iterative scoring ---
             note_frame_weights = _prep_note_weights(
-                ch_note_band_pairs, band_envs_ch, _COARSE_RATE)
-            if verbose and band_envs_ch:
-                profiles = _build_type_profiles(
-                    ch_note_band_pairs, band_envs_ch, _COARSE_RATE)
-                if profiles:
-                    def _pct(w): return f"k{w[0]:.0%}/s{w[1]:.0%}/c{w[2]:.0%}"
-                    print(f"  audio    : type profiles — "
-                          f"kick={_pct(profiles['kick'])}  "
-                          f"snare={_pct(profiles['snare'])}  "
-                          f"cymbal={_pct(profiles['cymbal'])}")
+                ch_note_band_pairs, None, _COARSE_RATE)
 
-            # --- 80-pass iterative frequency-adaptive note-to-audio ---
-            mode_label = "adaptive" if band_envs_ch else "fixed-band"
             if verbose:
-                print(f"  audio    : note→audio ({mode_label}, {_N_ALIGN_PASSES} passes) "
-                      f"vs RS {rs_label} …")
+                print(f"  audio    : extracting RS {rs_label} bands …",
+                      end=" ", flush=True)
+            t0 = time.time()
             band_envs_rs = _extract_band_envs(rs_tmp)
             if not band_envs_rs:
                 if verbose:
-                    print("  audio    : RS band extraction failed")
+                    print("failed")
                 return None, False
+            if verbose:
+                print(f"({time.time()-t0:.1f}s)")
 
             rs_dur_s = len(next(iter(band_envs_rs.values()))) / _COARSE_RATE
+            if verbose:
+                print(f"  audio    : note→audio (fixed-band, {_N_ALIGN_PASSES} passes, "
+                      f"{len(ch_note_band_pairs)} hits) …", end=" ", flush=True)
+            t0 = time.time()
             offset_n, score_n, n_iters = _note_align_iterative(
                 note_frame_weights, band_envs_rs, _COARSE_RATE,
                 max_search_s=_COARSE_SEARCH_S, n_passes=_N_ALIGN_PASSES,
                 zero_bias=_COARSE_ZERO_BIAS)
             if verbose:
+                print(f"({time.time()-t0:.1f}s)")
                 print(f"  audio    : note→audio  {offset_n:+.3f}s  "
-                      f"(score {score_n:.4f}, {n_iters}/{_N_ALIGN_PASSES} passes, "
-                      f"{len(ch_note_band_pairs)} hits [{mode_label}], RS={rs_dur_s:.0f}s)")
+                      f"score={score_n:.4f}  {n_iters}/{_N_ALIGN_PASSES} passes  "
+                      f"RS={rs_dur_s:.0f}s")
 
-            # --- Banded CH-audio vs RS-audio xcorr fine-tuning ---
-            total_s = offset_n
-            if band_envs_ch:
-                if verbose:
-                    print(f"  audio    : banded xcorr within ±{_AUDIO_AGREE_S*3:.1f}s …")
-                offset_a = _banded_xcorr_fine(
-                    band_envs_ch, band_envs_rs, _COARSE_RATE,
-                    anchor_s=offset_n, window_s=_AUDIO_AGREE_S * 3)
-                diff = abs(offset_a - offset_n)
-                if diff < _AUDIO_AGREE_S:
-                    total_s = offset_a
-                    if verbose:
-                        print(f"  audio    : audio xcorr {offset_a:+.3f}s  "
-                              f"(diff {diff:.3f}s ≤ {_AUDIO_AGREE_S}s) → using audio")
-                else:
-                    if verbose:
-                        print(f"  audio    : audio xcorr {offset_a:+.3f}s  "
-                              f"(diff {diff:.3f}s > {_AUDIO_AGREE_S}s) → keeping notes")
-
-            return total_s, True
+            if verbose:
+                print(f"  audio    : alignment total {time.time()-t0_total:.1f}s")
+            return offset_n, True
 
         # --- Fallback: full onset xcorr + multi-clip voting (no drum chart) ---
         ch_drum_files = _find_ch_drum_files(ch_dir)
@@ -1322,12 +1336,16 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
                     "album":      rs_meta.get("album",  ""),
                     "year_clean": str(rs_meta.get("year", "")),
                 },
-                arrangement_ids = list(diff_merged.keys()),
-                stem_ids        = rs["stem_ids"],
-                cover_filename  = rs["cover_name"],
-                has_lyrics      = rs["has_lyrics"] or bool(lyrics_data),
-                rs_arrangements = rs_meta.get("arrangements", []),
-                drum_tabs       = {"drums": "drum_tab_drums.json"} if diff_drum_tabs else {},
+                arrangement_ids   = list(diff_merged.keys()),
+                stem_ids          = rs["stem_ids"],
+                cover_filename    = rs["cover_name"],
+                has_lyrics        = rs["has_lyrics"] or bool(lyrics_data),
+                rs_arrangements   = rs_meta.get("arrangements", []),
+                drum_tabs         = {"drums": "drum_tab_drums.json"} if diff_drum_tabs else {},
+                arrangement_names = {
+                    "drums":       f"Drums ({diff_name})",
+                    "drums_score": f"Drums Score ({diff_name})",
+                },
             )
             _write_merged(
                 output_path         = diff_out,

@@ -147,7 +147,7 @@ drum highway, piano roll, or tab view).
 | Mode | Output | Behavior |
 |---|---|---|
 | Default (slider) | One `.sloppak` with `drums` / `drums_score` | Difficulty slider spans all available levels |
-| `--split-drums` | One `.sloppak` per difficulty: `Song (Expert).sloppak`, `Song (Hard).sloppak`, … | Each file is a complete standalone package — all stems, cover, lyrics, and non-drum arrangements duplicated; drum arrangement inside each file uses standard `drums` / `drums_score` IDs |
+| `--split-drums` | One `.sloppak` per difficulty: `Song (Expert).sloppak`, `Song (Hard).sloppak`, … | Each file is a complete standalone package — all stems, cover, lyrics, and non-drum arrangements duplicated; arrangement IDs are `drums` / `drums_score`; display names are `Drums (Expert)` / `Drums Score (Expert)` etc. |
 
 Keys and guitar/bass always use the slider mode regardless of `--split-drums`.
 
