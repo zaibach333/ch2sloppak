@@ -21,6 +21,8 @@ import yaml
 # Mirrors merge.py's _GAMEPAD_IDS renaming — keep in sync if that changes.
 _GAMEPAD_IDS = {"lead": "lead-gamepad", "bass": "bass-gamepad"}
 
+_DIFF_NAMES = {3: "expert", 2: "hard", 1: "medium", 0: "easy"}
+
 # Fuzzy match thresholds (SequenceMatcher ratio, 0–1).
 _FUZZY_COMBINED_THRESHOLD = 0.85   # artist+title sequence similarity
 _FUZZY_DEEP_THRESHOLD     = 0.82   # artist+title after noise-token stripping
@@ -137,17 +139,23 @@ def build_library_index(library_dir):
     return index
 
 
-def predict_merge_ids(tracks_dict):
+def predict_merge_ids(tracks_dict, split_drums=False):
     """
     Given a parsed tracks dict, return the arrangement IDs a merge would add.
     Mirrors merge.py track→arrangement mapping including gamepad renaming.
+    When split_drums=True, drums produce per-difficulty IDs like 'drums-expert'.
     """
     ids = []
     for track_id, diff_dict in tracks_dict.items():
         if not diff_dict:
             continue
         if track_id == "drums":
-            ids += ["drums", "drums_score"]
+            if split_drums:
+                for diff in diff_dict:
+                    name = _DIFF_NAMES.get(diff, str(diff))
+                    ids += [f"drums-{name}", f"drums_score-{name}"]
+            else:
+                ids += ["drums", "drums_score"]
         elif track_id == "keys":
             ids.append("keys")
         else:
@@ -206,7 +214,8 @@ def write_skippedlog(entries, dest_dir):
     return path
 
 
-def run(root_dir, output_dir=None, library_dir=None, force=False, verbose=True):
+def run(root_dir, output_dir=None, library_dir=None, force=False, verbose=True,
+        split_drums=False):
     """
     Batch-convert all CH song folders found under root_dir.
 
@@ -292,7 +301,7 @@ def run(root_dir, output_dir=None, library_dir=None, force=False, verbose=True):
                     print(f"  Match ({match_desc}): {os.path.basename(rs_path)}")
 
             if rs_path:
-                candidate_ids = predict_merge_ids(parsed["tracks"])
+                candidate_ids = predict_merge_ids(parsed["tracks"], split_drums=split_drums)
 
                 rs_base = re.sub(r'[<>:"/\\|?*]', "",
                                  os.path.splitext(os.path.basename(rs_path))[0])
@@ -341,6 +350,7 @@ def run(root_dir, output_dir=None, library_dir=None, force=False, verbose=True):
                     rs_sloppak_path=rs_path,
                     output_path=out_path,
                     verbose=verbose,
+                    split_drums=split_drums,
                 )
                 merge_entries.append({
                     "artist": artist, "title": title,
@@ -370,7 +380,8 @@ def run(root_dir, output_dir=None, library_dir=None, force=False, verbose=True):
                     skipped += 1
                     continue
 
-                main_mod.convert(song_dir=ch_dir, output_path=out_path, verbose=verbose)
+                main_mod.convert(song_dir=ch_dir, output_path=out_path, verbose=verbose,
+                                 split_drums=split_drums)
                 converted += 1
 
         except Exception as exc:

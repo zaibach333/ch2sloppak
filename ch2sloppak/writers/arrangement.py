@@ -196,6 +196,43 @@ def convert_drums_score(difficulties_dict):
     return arr
 
 
+_DIFF_NAMES = {3: "expert", 2: "hard", 1: "medium", 0: "easy"}
+
+
+def convert_drums_per_diff(difficulties_dict):
+    """One drums arrangement per available difficulty. Returns {arr_id: arr_dict}."""
+    result = {}
+    for diff in sorted(difficulties_dict, reverse=True):
+        hits = difficulties_dict[diff]
+        if not hits:
+            continue
+        name   = _DIFF_NAMES.get(diff, str(diff))
+        arr_id = f"drums-{name}"
+        arr    = _arrangement_shell(arr_id, [0, 0, 0, 0, 0, 0])
+        wire   = _drum_hits_to_wire(hits)
+        arr["notes"] = wire
+        if wire:
+            max_fret = max(n["f"] for n in wire)
+            arr["anchors"] = [{"time": 0.0, "fret": 0, "width": max_fret + 4}]
+        result[arr_id] = arr
+    return result
+
+
+def convert_drums_score_per_diff(difficulties_dict):
+    """One drums_score arrangement per available difficulty. Returns {arr_id: arr_dict}."""
+    result = {}
+    for diff in sorted(difficulties_dict, reverse=True):
+        hits = difficulties_dict[diff]
+        if not hits:
+            continue
+        name   = _DIFF_NAMES.get(diff, str(diff))
+        arr_id = f"drums_score-{name}"
+        arr    = _arrangement_shell(arr_id, [0, 0, 0, 0, 0, 0])
+        arr["notes"] = _drum_hits_to_wire_score(hits)
+        result[arr_id] = arr
+    return result
+
+
 def convert_drums(difficulties_dict):
     """
     difficulties_dict: {diff_int: [drum_hit_dicts]}

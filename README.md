@@ -20,6 +20,10 @@ python ch2sloppak.py convert <path/to/ch-song-folder>
 
 python ch2sloppak.py convert <path/to/ch-song-folder> -o my_song.sloppak
 
+# Split drums into one arrangement per difficulty instead of a slider:
+python ch2sloppak.py convert <path/to/ch-song-folder> --split-drums
+# → drums-expert, drums-hard, drums-medium, drums-easy (whichever exist)
+
 # Old-style invocation still works:
 python ch2sloppak.py <path/to/ch-song-folder>
 ```
@@ -39,12 +43,34 @@ python ch2sloppak.py merge <ch-folder> <rs.sloppak> --offset 1234.5
 
 # Fine-tune on top of auto-alignment (negative = shift earlier):
 python ch2sloppak.py merge <ch-folder> <rs.sloppak> --nudge -500
+
+# Split drums into one arrangement per difficulty:
+python ch2sloppak.py merge <ch-folder> <rs.sloppak> --split-drums
 ```
 
-The merge command auto-aligns CH note timing to the RS audio using
-inter-beat-interval cross-correlation of the two beat maps. The verbose output
-shows the detected beat shift (K), mean time offset, and IBI residual error — if
-the residual is high (> 20 ms), use `--offset` to correct manually.
+The merge command auto-aligns CH note timing to the RS audio in three stages:
+
+1. **80-pass iterative banded note-to-audio** — when a drum chart is present,
+   the RS stem is filtered into three frequency bands (kick <150 Hz,
+   snare 150–2500 Hz, cymbal >2500 Hz). Each CH drum note type is scored only
+   against its matching band, making a wrong-beat offset produce a genuinely
+   different score rather than just a timing shift. The search window decays
+   exponentially from ±30 s to ±1 frame over 80 passes; each pass applies the
+   found correction and rescores from the new position, converging to the true
+   beat from any starting point.
+2. **Banded CH-audio refinement** — if CH drum stems are present, they are
+   summed and split into the same three bands via IIR filters, then
+   cross-correlated per-band against the RS bands within ±0.9 s of the
+   note-derived estimate. If all three bands agree within 0.3 s the audio
+   result replaces the note estimate for sub-frame accuracy; otherwise the
+   note-derived offset is kept. Falls back to full-song onset-envelope
+   cross-correlation when no drum chart is available at all.
+3. **Beat IBI** — piecewise beat-map cross-correlation handles residual tempo
+   stretch within the aligned window.
+
+The verbose output shows the note score, convergence pass count, audio xcorr
+result (accepted/rejected), beat shift (K), mean time offset, and IBI residual
+— if the residual is high (> 20 ms), use `--offset` to correct manually.
 
 RS arrangements win on ID collision (e.g. if RS already has `lead`/`bass`,
 the CH gamepad versions are skipped). RS audio stems pass through unchanged;
@@ -71,6 +97,11 @@ python ch2sloppak.py batch <root> --library <path/to/sloppaks> -o <output-dir>
 
 # Overwrite existing output files (default is to skip them):
 python ch2sloppak.py batch <root> --library <path/to/sloppaks> -o <output-dir> --force
+
+# Split drums into per-difficulty arrangements across the whole batch:
+python ch2sloppak.py batch <root> --library <path/to/sloppaks> --split-drums
+# Duplicate detection uses difficulty-specific IDs (drums-expert, etc.) so
+# songs already converted without --split-drums will be re-merged/re-converted.
 ```
 
 **Default skip behaviour**: if a `.sloppak` output file already exists it is
@@ -108,10 +139,17 @@ The **Type** column matches the `type` field written to `manifest.yaml` — used
 Slopsmith plugins to route each arrangement to the correct view (guitar highway,
 drum highway, piano roll, or tab view).
 
-When 2+ difficulties are present a difficulty slider is enabled in Slopsmith
+**Drum difficulties — two modes:**
+
+| Mode | Arrangement IDs | Behavior |
+|---|---|---|
+| Default (slider) | `drums`, `drums_score` | One arrangement; difficulty slider spans all available levels |
+| `--split-drums` | `drums-expert`, `drums-hard`, `drums-medium`, `drums-easy` (present diffs only) + `drums_score-*` equivalents | Separate selectable arrangement per difficulty |
+
+Keys and guitar/bass always use the slider mode regardless of `--split-drums`.
+
+When 2+ difficulties are present in slider mode, a difficulty slider is enabled
 (top-level `notes` = highest difficulty; `phrases` array carries all levels).
-Note: the 3D drum highway reads `drum_tab_drums.json` directly and currently
-always displays Expert difficulty regardless of the slider position.
 
 In a **merge**, CH guitar/bass tracks are renamed `lead-gamepad` / `bass-gamepad`
 to avoid colliding with RS `lead` / `bass` arrangements.
@@ -130,7 +168,8 @@ to avoid colliding with RS `lead` / `bass` arrangements.
 | `song.ini` + `[Song]` section | `manifest.yaml` |
 | `[Events]` lyric events / MIDI VOCALS track | `lyrics.json` |
 | `album.png` / `album.jpg` | `cover.<ext>` |
-| Drums track (any difficulty) | `drum_tab_drums.json` |
+| Drums track — default | `drum_tab_drums.json` |
+| Drums track — `--split-drums` | `drum_tab_drums-expert.json`, `drum_tab_drums-hard.json`, … |
 
 ## Drum encoding (4-lane Pro)
 
@@ -156,8 +195,9 @@ marked muted (`mt: true`) to render as × noteheads.
 `.chart`: lanes 2/3/4 are toms by default; cymbal flags (66/67/68) mark cymbals.  
 `.mid`: lanes 2/3/4 are cymbals by default; tom-marker notes (110/111/112) mark toms.
 
-A `drum_tab_drums.json` file is written for every song with drums and referenced
-in the manifest — consumed by the `slopsmith-plugin-drum-highway-3d` plugin.
+A `drum_tab_drums.json` file (or per-difficulty files with `--split-drums`) is
+written for every song with drums and referenced in the manifest — consumed by
+the `slopsmith-plugin-drum-highway-3d` plugin.
 
 ## Guitar / Bass encoding
 
@@ -187,4 +227,4 @@ Routed to the piano roll via `type: piano` in the manifest.
 - No `.chart` support for Pro Keys (`.mid` only)
 - No 5-lane drums decoding (Pro drums only)
 - No chord-template grouping (simultaneous notes written as individual notes)
-- Drum highway difficulty slider shows Expert only (drum_tab format limitation)
+- Drum highway difficulty slider (default mode) shows Expert only in the 3D highway — use `--split-drums` to expose each difficulty as a separate selectable arrangement instead

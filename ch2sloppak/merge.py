@@ -154,28 +154,67 @@ def _lyrics_align(raw_ch_lyrics, rs_lyrics, verbose):
 
 
 # ---------------------------------------------------------------------------
-# Audio waveform alignment (two-level)
+# Audio waveform alignment
 # ---------------------------------------------------------------------------
 #
-# Level 1 – coarse: energy envelope at 50 Hz, ±60 s search → ~20 ms accuracy
-# Level 2 – fine:   raw waveform at 200 Hz in ±1.5 s window  → ~5 ms accuracy
+# Primary path (drum chart available):
+#   Step 1 — 80-pass iterative banded note-to-audio.
+#     RS stem is filtered into three bands (kick <150 Hz, snare 150–2500 Hz,
+#     cymbal >2500 Hz).  Each CH drum note type is scored against its matching
+#     band only — kicks vs low energy, snares vs mid, cymbals vs high.  The
+#     search window decays exponentially from ±30 s down to ±1 frame over 80
+#     passes, applying the correction each time and re-scoring from the new
+#     position, converging to the true beat from any starting point.
+#   Step 2 — banded CH-audio vs RS-audio xcorr refinement (if CH drums exist).
+#     CH drum stems are extracted and Python-IIR-filtered into the same three
+#     bands, then cross-correlated per-band against the RS bands within ±2 s of
+#     the note-derived estimate.  If the audio result agrees within 0.3 s it
+#     replaces the note estimate (finer sub-frame accuracy); otherwise the
+#     note-derived offset is kept.
 #
-# Both recordings are assumed to be the same take; the waveform correlation
-# peak is very sharp for identical audio and gives reliable sub-10 ms results.
+# Fallback path (no drum chart): full-song onset xcorr + multi-clip voting.
 #
-# Sign convention: lag > 0 means CH content appears lag frames LATER than RS,
+# Sign convention: lag > 0 means CH appears lag frames LATER than RS,
 # so offset_s = -lag / rate (what to ADD to CH note times to reach RS time).
 
-_COARSE_SR    = 200   # Hz for coarse extraction
-_COARSE_WIN   = 4     # samples per RMS window → 50 Hz envelope
-_COARSE_RATE  = _COARSE_SR // _COARSE_WIN
-_COARSE_SECS  = 90    # seconds to extract for coarse step
+_COARSE_RATE     = 50     # Hz — onset envelope rate for all scoring
+_COARSE_SEARCH_S = 30.0   # ±30 s initial search range
+_COARSE_ZERO_BIAS = 1e-4  # per-lag penalty to prefer smaller offsets on ties
+_N_ALIGN_PASSES  = 80     # iterative note-to-audio passes
+_CH_BAND_SR      = 8000   # sample rate for CH drum extraction (Python IIR filtered)
+_CH_BAND_WIN     = _CH_BAND_SR // _COARSE_RATE  # 160 → 50 Hz envelope
+_AUDIO_AGREE_S   = 0.3    # max note/audio diff (s) to trust the audio result
 
-_FINE_SR      = 200   # Hz for fine waveform correlation
-_FINE_CLIP_S  = 15    # seconds of audio to correlate
-_FINE_START_S = 30    # CH start time of fine clip (past most intros)
-_FINE_SEARCH_S = 1.5  # ±seconds fallback (used when beat interval unknown)
+# RS frequency band extraction: ffmpeg filters, SR/win = _COARSE_RATE
+_BAND_CFG = {
+    "kick":   {"sr": 400,  "af": "lowpass=f=150",                  "win": 8},
+    "snare":  {"sr": 4000, "af": "highpass=f=150,lowpass=f=2500",  "win": 80},
+    "cymbal": {"sr": 8000, "af": "highpass=f=2500",                "win": 160},
+}
 
+# Map (ch_note, cymbal_flag) → frequency band
+_DRUM_NOTE_BAND = {
+    (0,  False): "kick",   (0,  True):  "kick",
+    (32, False): "kick",   (32, True):  "kick",
+    (1,  False): "snare",  (1,  True):  "snare",
+    (2,  True):  "cymbal", (2,  False): "snare",   # hi-hat or tom_hi
+    (3,  True):  "cymbal", (3,  False): "snare",   # ride or tom_mid
+    (4,  True):  "cymbal", (4,  False): "snare",   # crash or tom_floor
+}
+
+# Fallback xcorr constants (used only when no drum chart is available)
+_COARSE_SR       = 200
+_COARSE_WIN      = 4
+_FINE_SR        = 200
+_FINE_CLIP_S    = 60
+_FINE_SEARCH_S  = 4.0
+_FINE_CONF_MIN  = 0.06
+_MULTI_STEP_S   = 50.0
+_MULTI_START_S  = 10.0
+_MULTI_FULL_S   = 240
+_MULTI_MIN_CORR = 0.02
+_MULTI_BIN_S    = 0.10
+_MULTI_MIN_CLIPS = 2
 
 _DRUM_AUDIO_EXTS = (".ogg", ".mp3", ".opus", ".wav", ".flac")
 
@@ -271,10 +310,15 @@ def _normalize(sig):
     return [x / std for x in centered]
 
 
-def _xcorr_best(a, b, max_lag):
-    """Cross-correlate a and b; return (best_lag, best_corr)."""
+def _xcorr_best(a, b, max_lag, zero_bias=0.0):
+    """Cross-correlate a and b; return (best_lag, best_corr).
+
+    zero_bias: subtract this * abs(lag) from each score so that when two
+    peaks have similar correlation the one closer to zero wins.  Does not
+    affect the returned best_corr value (raw score is reported).
+    """
     na, nb = len(a), len(b)
-    best_lag, best_corr = 0, float("-inf")
+    best_lag, best_corr, best_raw = 0, float("-inf"), float("-inf")
     for lag in range(-max_lag, max_lag + 1):
         a0 = max(0,  lag)
         b0 = max(0, -lag)
@@ -282,10 +326,12 @@ def _xcorr_best(a, b, max_lag):
         if n < 10:
             continue
         corr = sum(a[a0 + i] * b[b0 + i] for i in range(n)) / n
-        if corr > best_corr:
-            best_corr = corr
+        biased = corr - zero_bias * abs(lag)
+        if biased > best_corr:
+            best_corr = biased
+            best_raw  = corr
             best_lag  = lag
-    return best_lag, best_corr
+    return best_lag, best_raw
 
 
 def _sum_pcm(paths, sample_rate, start_s=0.0, duration_s=None):
@@ -319,32 +365,227 @@ def _pick_rs_stem(rs_sloppak_path):
     return (full or stems[0]), "mix"
 
 
-def _audio_align(ch_dir, rs_sloppak_path, verbose):
-    """Two-level onset alignment.
+def _extract_pcm_af(audio_path, sample_rate, af, duration_s=None):
+    """Extract mono PCM from audio_path with an ffmpeg audio filter applied."""
+    fd, raw_path = tempfile.mkstemp(suffix=".raw")
+    os.close(fd)
+    cmd = ["ffmpeg", "-y", "-i", audio_path]
+    if duration_s is not None:
+        cmd += ["-t", str(duration_s)]
+    cmd += ["-af", af, "-ar", str(sample_rate), "-ac", "1", "-f", "s16le", raw_path]
+    try:
+        subprocess.run(cmd, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(raw_path, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.unlink(raw_path)
+        except OSError:
+            pass
+    n = len(data) // 2
+    if not n:
+        return []
+    return list(struct.unpack(f"<{n}h", data))
 
-    Uses CH drum stems (split or merged) when available — drum transients
-    are far more distinctive than a full mix and produce cleaner correlation.
-    Falls back to any CH audio if no drum stems are found.  On the RS side,
-    prefers stems/drums.ogg over the full mix for the same reason.
 
-    Returns (offset_seconds, used_drums: bool) or (None, False) on failure.
+def _extract_band_envs(audio_path):
+    """Extract frequency-band onset envelopes (each at _COARSE_RATE Hz) from audio.
+
+    Returns {band: env} with bands 'kick', 'snare', 'cymbal', or None on failure.
+    Each env is normalised so peak = 1.0.
     """
-    # Choose CH source: drum stems > full mix
-    ch_drum_files = _find_ch_drum_files(ch_dir)
-    if ch_drum_files:
-        ch_paths  = ch_drum_files
-        ch_label  = f"drums ({len(ch_drum_files)} stem{'s' if len(ch_drum_files) > 1 else ''})"
-        use_drums = True
-    else:
-        ch_audio = _find_ch_audio(ch_dir)
-        if not ch_audio:
-            if verbose:
-                print("  audio    : no CH audio found")
-            return None, False
-        ch_paths  = [ch_audio]
-        ch_label  = "mix"
-        use_drums = False
+    result = {}
+    for band, cfg in _BAND_CFG.items():
+        pcm = _extract_pcm_af(audio_path, cfg["sr"], cfg["af"])
+        if not pcm:
+            return None
+        env = _onset_envelope(pcm, cfg["win"])
+        peak = max(env) if env else 0.0
+        result[band] = [v / peak for v in env] if peak > 1e-10 else [0.0] * len(env)
+    # Trim all bands to the same (shortest) length
+    min_len = min(len(v) for v in result.values())
+    return {b: v[:min_len] for b, v in result.items()}
 
+
+def _drum_hits_to_band_pairs(hits, time_offset_s=0.0):
+    """Convert parsed drum hits to [(time_s, band), ...] sorted by time."""
+    pairs = []
+    for h in hits:
+        t    = h["time_ms"] / 1000.0 + time_offset_s
+        band = _DRUM_NOTE_BAND.get((h["ch_note"], h.get("cymbal_flag", False)), "snare")
+        pairs.append((t, band))
+    pairs.sort()
+    return pairs
+
+
+import math as _math
+
+def _iir_lowpass(samples, cutoff_hz, sr):
+    """First-order IIR lowpass filter (in-place style, returns new list)."""
+    rc = 1.0 / (2.0 * _math.pi * cutoff_hz)
+    a  = (1.0 / sr) / (rc + 1.0 / sr)
+    b  = 1.0 - a
+    y  = 0.0
+    out = [0.0] * len(samples)
+    for i, x in enumerate(samples):
+        y = a * x + b * y
+        out[i] = y
+    return out
+
+
+def _iir_highpass(samples, cutoff_hz, sr):
+    """First-order IIR highpass filter."""
+    rc = 1.0 / (2.0 * _math.pi * cutoff_hz)
+    dt = 1.0 / sr
+    a  = rc / (rc + dt)
+    xp = samples[0] if samples else 0.0
+    yp = 0.0
+    out = [0.0] * len(samples)
+    for i, x in enumerate(samples):
+        y = a * (yp + x - xp)
+        xp, yp = x, y
+        out[i] = y
+    return out
+
+
+def _extract_band_envs_paths(paths):
+    """Extract banded onset envelopes from CH drum stems using Python IIR filters.
+
+    Sums all stems at _CH_BAND_SR, then filters into kick/snare/cymbal bands.
+    Returns {band: env} normalised to peak=1.0, or None on failure.
+    """
+    pcm = _sum_pcm(paths, _CH_BAND_SR)
+    if not pcm:
+        return None
+    kick   = _iir_lowpass(pcm, 150, _CH_BAND_SR)
+    hp_lo  = _iir_highpass(pcm, 150, _CH_BAND_SR)
+    snare  = _iir_lowpass(hp_lo, 2500, _CH_BAND_SR)
+    cymbal = _iir_highpass(pcm, 2500, _CH_BAND_SR)
+    result = {}
+    for band, band_pcm in (("kick", kick), ("snare", snare), ("cymbal", cymbal)):
+        env  = _onset_envelope(band_pcm, _CH_BAND_WIN)
+        peak = max(env) if env else 0.0
+        result[band] = [v / peak for v in env] if peak > 1e-10 else [0.0] * len(env)
+    min_len = min(len(v) for v in result.values())
+    return {b: v[:min_len] for b, v in result.items()}
+
+
+def _note_align_iterative(note_band_pairs, band_envs, coarse_rate,
+                           max_search_s=30.0, n_passes=80, zero_bias=1e-4):
+    """Iteratively refine note-to-audio offset over n_passes.
+
+    Search window decays exponentially from ±max_search_s to ±1 frame over
+    n_passes.  Each pass applies the current offset to note positions, finds
+    the best correction within the window, and updates.  Convergence (lag=0)
+    terminates early; the window guarantees we can escape wrong-beat local
+    maxima before zooming in.
+
+    Returns (offset_s, final_score, passes_taken).
+    """
+    start_lag = max(1, int(max_search_s * coarse_rate))
+    min_lag   = 1
+    decay     = (min_lag / start_lag) ** (1.0 / max(n_passes - 1, 1))
+
+    offset      = 0.0
+    score       = 0.0
+    passes_taken = n_passes
+
+    for i in range(n_passes):
+        max_lag = max(min_lag, int(start_lag * decay ** i))
+        shifted = [(t + offset, b) for t, b in note_band_pairs]
+        lag, score = _note_onset_align_banded(shifted, band_envs, coarse_rate,
+                                               max_lag, zero_bias=zero_bias)
+        offset += -lag / coarse_rate
+        if lag == 0:
+            passes_taken = i + 1
+            break
+
+    return offset, score, passes_taken
+
+
+def _banded_xcorr_fine(band_envs_ch, band_envs_rs, coarse_rate,
+                        anchor_s, window_s=2.0):
+    """Per-band xcorr (CH vs RS) within ±window_s of anchor_s.
+
+    For each band, xcorr the full envelopes restricted to lags near anchor_s.
+    Returns the correlation-weighted mean offset, or anchor_s on failure.
+    """
+    anchor_lag = -round(anchor_s * coarse_rate)
+    fine_max   = max(1, int(window_s * coarse_rate))
+
+    results = []
+    for band in ("kick", "snare", "cymbal"):
+        ch_n = _normalize(band_envs_ch.get(band, []))
+        rs_n = _normalize(band_envs_rs.get(band, []))
+        if not ch_n or not rs_n:
+            continue
+        na, nb = len(ch_n), len(rs_n)
+        best_lag, best_corr = anchor_lag, float("-inf")
+        for lag in range(anchor_lag - fine_max, anchor_lag + fine_max + 1):
+            a0 = max(0, lag)
+            b0 = max(0, -lag)
+            n  = min(na - a0, nb - b0)
+            if n < 20:
+                continue
+            corr = sum(ch_n[a0 + k] * rs_n[b0 + k] for k in range(n)) / n
+            if corr > best_corr:
+                best_corr = corr
+                best_lag  = lag
+        results.append((-best_lag / coarse_rate, max(0.0, best_corr)))
+
+    if not results:
+        return anchor_s
+    total_w = sum(c for _, c in results) or 1e-10
+    return sum(o * c for o, c in results) / total_w
+
+
+def _note_onset_align_banded(note_band_pairs, band_envs, coarse_rate, max_lag,
+                              zero_bias=0.0):
+    """Score each candidate lag using frequency-band-matched note-to-audio scoring.
+
+    Each drum note is scored against the onset envelope of its expected band:
+    kicks against low-band energy, snares/toms against mid, cymbals against high.
+    At a wrong offset, notes land on the wrong band's energy or silence, collapsing
+    the score even when total onset density looks similar to the correct offset.
+
+    Returns (best_lag, best_avg_score).  Sign: offset_s = -lag / coarse_rate.
+    """
+    note_frames = [(round(t * coarse_rate), band) for t, band in note_band_pairs]
+    n_rs = len(next(iter(band_envs.values()))) if band_envs else 0
+    fallback = band_envs.get("snare", next(iter(band_envs.values()), []))
+
+    best_lag, best_score = 0, float("-inf")
+    for lag in range(-max_lag, max_lag + 1):
+        score = 0.0
+        count = 0
+        for f, band in note_frames:
+            idx = f - lag
+            if 0 <= idx < n_rs:
+                score += band_envs.get(band, fallback)[idx]
+                count += 1
+        if count < 10:
+            continue
+        avg = score / count - zero_bias * abs(lag)
+        if avg > best_score:
+            best_score = avg
+            best_lag   = lag
+    return best_lag, best_score
+
+
+def _audio_align(ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs=None):
+    """Banded two-pass note-to-audio alignment (primary) or onset xcorr (fallback).
+
+    Primary path (drum chart available):
+      Extracts the RS stem into three frequency bands (kick/snare/cymbal) and
+      scores each candidate offset by matching note types to their expected band.
+      Pass 1 searches ±30 s; pass 2 applies that offset and re-checks ±2 s.
+      No CH audio is required — only RS audio and chart note data.
+
+    Fallback path (no drum chart): full-song onset xcorr + multi-clip voting.
+
+    Returns (offset_seconds, drum_anchor: bool) or (None, False) on failure.
+    """
     rs_stem_name, rs_label = _pick_rs_stem(rs_sloppak_path)
     if not rs_stem_name:
         if verbose:
@@ -359,49 +600,145 @@ def _audio_align(ch_dir, rs_sloppak_path, verbose):
             with open(rs_tmp, "wb") as f:
                 f.write(zf.read(rs_stem_name))
 
+        max_lag = int(_COARSE_SEARCH_S * _COARSE_RATE)
+
+        if ch_note_band_pairs:
+            # --- 80-pass iterative banded note-to-audio ---
+            if verbose:
+                print(f"  audio    : note→audio (banded, {_N_ALIGN_PASSES} passes) "
+                      f"vs RS {rs_label} …")
+            band_envs_rs = _extract_band_envs(rs_tmp)
+            if not band_envs_rs:
+                if verbose:
+                    print("  audio    : RS band extraction failed")
+                return None, False
+
+            rs_dur_s = len(next(iter(band_envs_rs.values()))) / _COARSE_RATE
+            offset_n, score_n, n_iters = _note_align_iterative(
+                ch_note_band_pairs, band_envs_rs, _COARSE_RATE,
+                max_search_s=_COARSE_SEARCH_S, n_passes=_N_ALIGN_PASSES,
+                zero_bias=_COARSE_ZERO_BIAS)
+            if verbose:
+                print(f"  audio    : note→audio  {offset_n:+.3f}s  "
+                      f"(score {score_n:.4f}, {n_iters}/{_N_ALIGN_PASSES} passes, "
+                      f"{len(ch_note_band_pairs)} hits, RS={rs_dur_s:.0f}s)")
+
+            # --- Banded CH-audio vs RS-audio xcorr fine-tuning ---
+            total_s = offset_n
+            ch_drum_files = _find_ch_drum_files(ch_dir)
+            if ch_drum_files:
+                if verbose:
+                    ch_label = (f"drums ({len(ch_drum_files)} stem"
+                                f"{'s' if len(ch_drum_files) > 1 else ''})")
+                    print(f"  audio    : CH {ch_label} banded xcorr "
+                          f"within ±{_AUDIO_AGREE_S*3:.1f}s …")
+                band_envs_ch = _extract_band_envs_paths(ch_drum_files)
+                if band_envs_ch:
+                    offset_a = _banded_xcorr_fine(
+                        band_envs_ch, band_envs_rs, _COARSE_RATE,
+                        anchor_s=offset_n, window_s=_AUDIO_AGREE_S * 3)
+                    diff = abs(offset_a - offset_n)
+                    if diff < _AUDIO_AGREE_S:
+                        total_s = offset_a
+                        if verbose:
+                            print(f"  audio    : audio xcorr {offset_a:+.3f}s  "
+                                  f"(diff {diff:.3f}s ≤ {_AUDIO_AGREE_S}s) → using audio")
+                    else:
+                        if verbose:
+                            print(f"  audio    : audio xcorr {offset_a:+.3f}s  "
+                                  f"(diff {diff:.3f}s > {_AUDIO_AGREE_S}s) → keeping notes")
+
+            return total_s, True
+
+        # --- Fallback: full onset xcorr + multi-clip voting (no drum chart) ---
+        ch_drum_files = _find_ch_drum_files(ch_dir)
+        if ch_drum_files:
+            ch_paths  = ch_drum_files
+            ch_label  = f"drums ({len(ch_drum_files)} stem{'s' if len(ch_drum_files) > 1 else ''})"
+            use_drums = True
+        else:
+            ch_audio = _find_ch_audio(ch_dir)
+            if not ch_audio:
+                if verbose:
+                    print("  audio    : no CH audio found")
+                return None, False
+            ch_paths  = [ch_audio]
+            ch_label  = "mix"
+            use_drums = False
+
         if verbose:
-            print(f"  audio    : CH {ch_label} → RS {rs_label} …")
+            print(f"  audio    : CH {ch_label} → RS {rs_label} (xcorr fallback) …")
 
-        # --- Level 1: coarse onset-envelope correlation (50 Hz) ---
-        # Sum PCM across CH drum splits so every hit contributes to the signal.
-        ch_coarse_pcm = _sum_pcm(ch_paths, _COARSE_SR, duration_s=_COARSE_SECS)
-        rs_coarse_pcm = _extract_pcm(rs_tmp, _COARSE_SR, duration_s=_COARSE_SECS)
+        rs_coarse_pcm = _extract_pcm(rs_tmp, _COARSE_SR)
+        if not rs_coarse_pcm:
+            return None, False
+        rs_env_raw = _onset_envelope(rs_coarse_pcm, _COARSE_WIN)
+        if not rs_env_raw:
+            return None, False
 
+        ch_coarse_pcm = _sum_pcm(ch_paths, _COARSE_SR)
+        if not ch_coarse_pcm:
+            return None, False
         ch_env = _normalize(_onset_envelope(ch_coarse_pcm, _COARSE_WIN))
-        rs_env = _normalize(_onset_envelope(rs_coarse_pcm, _COARSE_WIN))
-
+        rs_env = _normalize(rs_env_raw)
         if not ch_env or not rs_env:
             return None, False
 
-        lag1, _ = _xcorr_best(ch_env, rs_env, int(60 * _COARSE_RATE))
+        ch_dur_s  = len(ch_coarse_pcm) / _COARSE_SR
+        rs_dur_s  = len(rs_coarse_pcm) / _COARSE_SR
+        lag1, _   = _xcorr_best(ch_env, rs_env, max_lag, zero_bias=_COARSE_ZERO_BIAS)
         offset1_s = -lag1 / _COARSE_RATE
-
         if verbose:
-            print(f"  audio    : coarse {offset1_s:+.2f} s")
+            print(f"  audio    : onset xcorr  CH={ch_dur_s:.0f}s RS={rs_dur_s:.0f}s "
+                  f"→ coarse {offset1_s:+.3f}s")
 
-        # --- Level 2: fine PCM correlation (200 Hz, ±1.5 s window) ---
-        # Summing raw PCM from drum splits amplifies transients further.
-        rs_fine_start = max(0.0, _FINE_START_S + offset1_s)
-        ch_fine_pcm   = _sum_pcm(ch_paths, _FINE_SR,
-                                  start_s=_FINE_START_S, duration_s=_FINE_CLIP_S)
-        rs_fine_pcm   = _extract_pcm(rs_tmp, _FINE_SR,
-                                      start_s=rs_fine_start, duration_s=_FINE_CLIP_S)
+        fine_max_lag = max(1, int(_FINE_SEARCH_S * _FINE_SR))
+        clip_samples = int(_FINE_CLIP_S * _FINE_SR)
+        ch_full = _sum_pcm(ch_paths, _FINE_SR, duration_s=_MULTI_FULL_S)
+        rs_full = _extract_pcm(rs_tmp, _FINE_SR, duration_s=_MULTI_FULL_S)
 
-        ch_fine = _normalize(ch_fine_pcm)
-        rs_fine = _normalize(rs_fine_pcm)
+        vote_results = []
+        pos = _MULTI_START_S
+        while pos + _FINE_CLIP_S <= _MULTI_FULL_S:
+            ch_i = int(pos * _FINE_SR)
+            rs_i = int((pos + offset1_s) * _FINE_SR)
+            if (0 <= ch_i and ch_i + clip_samples <= len(ch_full) and
+                    0 <= rs_i and rs_i + clip_samples <= len(rs_full)):
+                ch_clip = _normalize(ch_full[ch_i: ch_i + clip_samples])
+                rs_clip = _normalize(rs_full[rs_i: rs_i + clip_samples])
+                if ch_clip and rs_clip:
+                    lag_f, corr_f = _xcorr_best(ch_clip, rs_clip, fine_max_lag)
+                    if corr_f >= _MULTI_MIN_CORR:
+                        vote_results.append((-lag_f / _FINE_SR, corr_f))
+            pos += _MULTI_STEP_S
 
-        if ch_fine and rs_fine:
-            lag2, corr2 = _xcorr_best(
-                ch_fine, rs_fine, max(1, int(_FINE_SEARCH_S * _FINE_SR)))
-            offset2_s = -lag2 / _FINE_SR
-            total     = offset1_s + offset2_s
+        if not vote_results:
+            return offset1_s, use_drums
+
+        bins = {}
+        for fine_off, corr in vote_results:
+            b = round(fine_off / _MULTI_BIN_S)
+            bins[b] = bins.get(b, 0.0) + corr
+        best_bin    = max(bins, key=bins.get)
+        inliers     = [(o, c) for o, c in vote_results
+                       if abs(o - best_bin * _MULTI_BIN_S) <= _MULTI_BIN_S]
+        n_inliers   = len(inliers)
+        cluster_off = sum(o for o, c in inliers) / n_inliers
+        avg_corr    = sum(c for o, c in inliers) / n_inliers
+
+        confident = n_inliers >= _MULTI_MIN_CLIPS and avg_corr >= _FINE_CONF_MIN
+
+        if not confident:
             if verbose:
-                print(f"  audio    : fine {offset2_s:+.3f} s "
-                      f"(±{_FINE_SEARCH_S * 1000:.0f} ms) → "
-                      f"total {total:+.3f} s  (corr {corr2:.3f})")
-            return total, use_drums
+                print(f"  audio    : vote low-conf (n={n_inliers}/{len(vote_results)}, "
+                      f"corr={avg_corr:.3f}), coarse {offset1_s:+.3f}s as loose prior")
+            return offset1_s, False
 
-        return offset1_s, use_drums
+        total = offset1_s + cluster_off
+        if verbose:
+            print(f"  audio    : {n_inliers}/{len(vote_results)} clips → fine {cluster_off:+.3f}s "
+                  f"total {total:+.3f}s  (avg corr {avg_corr:.3f})")
+        return total, use_drums
 
     except Exception as exc:
         if verbose:
@@ -616,7 +953,8 @@ def _write_merged(output_path, manifest_yaml, merged_arrangements,
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.0, verbose=True):
+def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.0,
+          verbose=True, split_drums=False):
     """
     Merge a CH song folder with an RS .sloppak.
     Returns the path of the written package.
@@ -697,7 +1035,18 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
         drum_anchor = False
 
         if prior_offset_s is None:
-            audio_offset_s, drum_anchor = _audio_align(ch_dir, rs_sloppak_path, verbose)
+            # Build (time_s, band) pairs from the best drum difficulty.
+            # Times are in CH audio time (chart_time + ch_audio_delay_s) so they
+            # align with the RS audio timeline being scored against.
+            ch_note_band_pairs = None
+            if "drums" in parsed["tracks"] and parsed["tracks"]["drums"]:
+                drum_track = parsed["tracks"]["drums"]
+                best_diff  = max(drum_track.keys())
+                ch_note_band_pairs = _drum_hits_to_band_pairs(
+                    drum_track[best_diff], time_offset_s=ch_audio_delay_s)
+
+            audio_offset_s, drum_anchor = _audio_align(
+                ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs)
             if audio_offset_s is not None:
                 # Audio correlation gives CH-audio → RS-audio offset.
                 # CH audio position = CH chart time + ch_audio_delay_s
@@ -754,8 +1103,12 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
         if not diff_dict:
             continue
         if track_id == "drums":
-            ch_arrangements["drums"]       = arrangement_writer.convert_drums(diff_dict)
-            ch_arrangements["drums_score"] = arrangement_writer.convert_drums_score(diff_dict)
+            if split_drums:
+                ch_arrangements.update(arrangement_writer.convert_drums_per_diff(diff_dict))
+                ch_arrangements.update(arrangement_writer.convert_drums_score_per_diff(diff_dict))
+            else:
+                ch_arrangements["drums"]       = arrangement_writer.convert_drums(diff_dict)
+                ch_arrangements["drums_score"] = arrangement_writer.convert_drums_score(diff_dict)
         elif track_id == "keys":
             ch_arrangements["keys"] = arrangement_writer.convert_keys(diff_dict)
         else:
@@ -764,13 +1117,14 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
                 diff_dict, arrangement_name=out_id)
 
     # --- drum_tabs (for slopsmith-plugin-drum-highway-3d) ---
-    # Only real drums get a drum_tab file.  Guitar/bass/rhythm gamepad tracks
-    # display on the guitar highway via GUITAR_LANE_MAP (string colors match).
     drum_tabs = {}
     if "drums" in parsed["tracks"] and parsed["tracks"]["drums"]:
-        dt = drum_tab_writer.convert(parsed["tracks"]["drums"])
-        if dt:
-            drum_tabs["drums"] = dt
+        if split_drums:
+            drum_tabs = drum_tab_writer.convert_per_diff(parsed["tracks"]["drums"])
+        else:
+            dt = drum_tab_writer.convert(parsed["tracks"]["drums"])
+            if dt:
+                drum_tabs["drums"] = dt
 
     # Retime and stamp RS beats onto each CH arrangement
     for arr in ch_arrangements.values():
@@ -779,12 +1133,13 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
             arr["beats"] = rs["rs_beats"]
 
     # Retime drum_tab hits
-    if "drums" in drum_tabs:
-        for hit in drum_tabs["drums"]["hits"]:
+    for tab in drum_tabs.values():
+        for hit in tab["hits"]:
             hit["t"] = round(shift_fn(hit["t"]), 3)
-        drum_tabs["drums"]["hits"].sort(key=lambda h: h["t"])
-        if verbose:
-            print(f"  drum_tab : {len(drum_tabs['drums']['hits'])} hits")
+        tab["hits"].sort(key=lambda h: h["t"])
+    if verbose and drum_tabs:
+        total_hits = sum(len(t["hits"]) for t in drum_tabs.values())
+        print(f"  drum_tab : {total_hits} hits")
 
     # --- merge: RS wins on ID collision ---
     merged = dict(rs["arrangements"])
