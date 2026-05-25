@@ -76,7 +76,7 @@ def _merge_metadata(ini_meta, chart_song_meta):
 # Main conversion
 # ---------------------------------------------------------------------------
 
-def convert(song_dir, output_path=None, verbose=True):
+def convert(song_dir, output_path=None, verbose=True, split_drums=False):
     """
     Convert a CH song folder to a .sloppak file.
     Returns the path of the written package.
@@ -123,26 +123,41 @@ def convert(song_dir, output_path=None, verbose=True):
             print(f"  artist: {artist}")
 
     # --- convert arrangements ---
+    _diff_label = {3: "E", 2: "H", 1: "M", 0: "Ey"}
     arrangements = {}
     for track_id, diff_dict in parsed["tracks"].items():
         if not diff_dict:
             continue
+        total_notes  = sum(len(d) for d in diff_dict.values())
+        diff_label   = "/".join(_diff_label.get(d, str(d))
+                                for d in sorted(diff_dict.keys(), reverse=True))
         if track_id == "drums":
-            arr = arrangement_writer.convert_drums(diff_dict)
-            arrangements["drums_score"] = arrangement_writer.convert_drums_score(diff_dict)
+            if split_drums:
+                new = {**arrangement_writer.convert_drums_per_diff(diff_dict),
+                       **arrangement_writer.convert_drums_score_per_diff(diff_dict)}
+                arrangements.update(new)
+                if verbose:
+                    ids = sorted(k for k in new if not k.startswith("drums_score"))
+                    print(f"  [drums] {total_notes} notes ({diff_label}) → {', '.join(ids)}")
+            else:
+                arr = arrangement_writer.convert_drums(diff_dict)
+                arrangements["drums"]       = arr
+                arrangements["drums_score"] = arrangement_writer.convert_drums_score(diff_dict)
+                if verbose:
+                    print(f"  [drums] {total_notes} notes ({diff_label})"
+                          + (" + phrases" if arr.get("phrases") else ""))
         elif track_id == "keys":
             arr = arrangement_writer.convert_keys(diff_dict)
+            arrangements["keys"] = arr
+            if verbose:
+                print(f"  [keys] {total_notes} notes ({diff_label})"
+                      + (" + phrases" if arr.get("phrases") else ""))
         else:
             arr = arrangement_writer.convert_guitar(diff_dict, arrangement_name=track_id)
-
-        total_notes = sum(len(d) for d in diff_dict.values())
-        if verbose:
-            diffs_present = sorted(diff_dict.keys(), reverse=True)
-            diff_names = {3: "E", 2: "H", 1: "M", 0: "Ey"}
-            label = "/".join(diff_names[d] for d in diffs_present)
-            print(f"  [{track_id}] {total_notes} notes ({label})"
-                  + (" + phrases" if arr.get("phrases") else ""))
-        arrangements[track_id] = arr
+            arrangements[track_id] = arr
+            if verbose:
+                print(f"  [{track_id}] {total_notes} notes ({diff_label})"
+                      + (" + phrases" if arr.get("phrases") else ""))
 
     if not arrangements and verbose:
         print("  WARNING: no note data found")
@@ -168,15 +183,17 @@ def convert(song_dir, output_path=None, verbose=True):
         print(f"  lyrics: {len(lyrics_data)} syllables")
 
     # --- drum_tabs (for slopsmith-plugin-drum-highway-3d) ---
-    # Only real drums get a drum_tab file.  Guitar/bass/rhythm gamepad tracks
-    # display on the guitar highway via GUITAR_LANE_MAP (string colors match).
     drum_tabs = {}
     if "drums" in parsed["tracks"] and parsed["tracks"]["drums"]:
-        dt = drum_tab_writer.convert(parsed["tracks"]["drums"])
-        if dt:
-            drum_tabs["drums"] = dt
+        if split_drums:
+            drum_tabs = drum_tab_writer.convert_per_diff(parsed["tracks"]["drums"])
+        else:
+            dt = drum_tab_writer.convert(parsed["tracks"]["drums"])
+            if dt:
+                drum_tabs["drums"] = dt
     if verbose and drum_tabs:
-        print(f"  drum_tab: {len(drum_tabs['drums']['hits'])} hits")
+        total_hits = sum(len(t["hits"]) for t in drum_tabs.values())
+        print(f"  drum_tab: {total_hits} hits")
 
     # --- stems + cover (discover before manifest so both are accurate) ---
     stem_ids   = sloppak_writer.find_stem_ids(song_dir)
@@ -238,6 +255,9 @@ def main():
     conv.add_argument("song_folder", help="Path to the CH song folder")
     conv.add_argument("-o", "--output", metavar="FILE",
                       help="Output .sloppak path (default: auto-named next to folder)")
+    conv.add_argument("--split-drums", action="store_true",
+                      help="Create one drums/drums_score arrangement per difficulty "
+                           "instead of a single arrangement with a difficulty slider")
     conv.add_argument("-q", "--quiet", action="store_true",
                       help="Suppress progress output")
 
@@ -257,6 +277,9 @@ def main():
                      help="Extra ms to add on top of auto-alignment "
                           "(negative = shift earlier). "
                           "Tip: 2 quarter notes earlier at 120 BPM ≈ --nudge -1000")
+    mrg.add_argument("--split-drums", action="store_true",
+                     help="Create one drums/drums_score arrangement per difficulty "
+                          "instead of a single arrangement with a difficulty slider")
     mrg.add_argument("-q", "--quiet", action="store_true",
                      help="Suppress progress output")
 
@@ -274,6 +297,10 @@ def main():
                           "songs are merged instead of converted standalone")
     bat.add_argument("--force", action="store_true",
                      help="Overwrite existing output files (default: skip them)")
+    bat.add_argument("--split-drums", action="store_true",
+                     help="Create one drums/drums_score arrangement per difficulty "
+                          "instead of a single arrangement with a difficulty slider; "
+                          "duplicate detection uses difficulty-specific IDs")
     bat.add_argument("-q", "--quiet", action="store_true",
                      help="Suppress progress output")
 
@@ -283,10 +310,11 @@ def main():
     if args.command is None:
         if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
             # Re-parse as implicit convert
-            args.command    = "convert"
+            args.command     = "convert"
             args.song_folder = sys.argv[1]
-            args.output     = None
-            args.quiet      = "--quiet" in sys.argv or "-q" in sys.argv
+            args.output      = None
+            args.quiet       = "--quiet" in sys.argv or "-q" in sys.argv
+            args.split_drums = "--split-drums" in sys.argv
         else:
             parser.print_help()
             sys.exit(1)
@@ -295,7 +323,8 @@ def main():
         if args.command == "convert":
             out = convert(song_dir=args.song_folder,
                           output_path=args.output,
-                          verbose=not args.quiet)
+                          verbose=not args.quiet,
+                          split_drums=args.split_drums)
             print(f"Done: {out}")
 
         elif args.command == "merge":
@@ -306,6 +335,7 @@ def main():
                 offset_ms       = args.offset,
                 nudge_ms        = args.nudge,
                 verbose         = not args.quiet,
+                split_drums     = args.split_drums,
             )
             print(f"Done: {out}")
 
@@ -316,6 +346,7 @@ def main():
                 library_dir = args.library,
                 force       = args.force,
                 verbose     = not args.quiet,
+                split_drums = args.split_drums,
             )
 
     except FileNotFoundError as exc:

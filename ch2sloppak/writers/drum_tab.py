@@ -46,6 +46,22 @@ _GUITAR_LANE_TO_PIECE = {
 }
 
 
+_DIFF_NAMES = {3: "expert", 2: "hard", 1: "medium", 0: "easy"}
+
+
+def convert_per_diff(difficulties_dict):
+    """One drum_tab dict per available difficulty. Returns {arr_id: drum_tab_dict}."""
+    result = {}
+    for diff, hits in difficulties_dict.items():
+        if not hits:
+            continue
+        tab = convert({diff: hits})
+        if tab:
+            name = _DIFF_NAMES.get(diff, str(diff))
+            result[f"drums-{name}"] = tab
+    return result
+
+
 def convert(difficulties_dict):
     """
     Convert CH drum hit dicts to drum_tab format.
