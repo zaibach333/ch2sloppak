@@ -150,12 +150,15 @@ def _lyrics_align(raw_ch_lyrics, rs_lyrics, verbose):
     if verbose:
         print(f"  lyrics   : {len(inliers)}/{len(offsets)} matches → offset {offset_s:+.3f} s")
 
-    # Require at least 10 inliers AND ≥2% of RS lyrics matched to trust the result.
-    # A small absolute count is easily hit by chance in large RS lyric sets.
-    min_inliers = max(10, int(0.02 * len(rs_lyrics)))
-    if len(inliers) < min_inliers:
+    # Require at least 20 inliers AND ≥5% of all candidate pairs are inliers.
+    # The pair count inflates when common words appear many times; a low inlier
+    # ratio (e.g. 19/1900 = 1%) means the cluster is noise, not a real signal.
+    min_abs  = 20
+    min_frac = 0.05
+    ratio    = len(inliers) / max(len(offsets), 1)
+    if len(inliers) < min_abs or ratio < min_frac:
         if verbose:
-            print(f"  lyrics   : rejected (need {min_inliers}, got {len(inliers)})")
+            print(f"  lyrics   : rejected ({len(inliers)} inliers, {ratio:.1%} ratio — need {min_abs}/{min_frac:.0%})")
         return None
     return offset_s
 
@@ -188,7 +191,11 @@ def _lyrics_align(raw_ch_lyrics, rs_lyrics, verbose):
 _COARSE_RATE       = 50     # Hz — onset envelope rate for all scoring
 _COARSE_SEARCH_S   = 30.0   # ±30 s initial search range
 _COARSE_ZERO_BIAS  = 1e-4   # per-lag penalty to prefer smaller offsets on ties
-_N_ALIGN_PASSES    = 3      # iterative note-to-audio passes
+_N_ALIGN_PASSES    = 20     # iterative note-to-audio passes
+_XCORR_SCORE_MIN   = 0.12   # minimum banded xcorr score to trust as drum anchor
+_NOTE_SCORE_MIN    = 0.05   # minimum note→audio score to trust as alignment prior
+_NOTE_XCORR_MIN    = 0.04   # minimum note-time xcorr score to use as prior
+_NOTE_XCORR_WIN    = 3      # ±frames (±60 ms at 50 Hz) smoothing for note onsets
 _CH_BAND_SR        = 8000   # sample rate for CH drum extraction (Python IIR filtered)
 _CH_BAND_WIN       = _CH_BAND_SR // _COARSE_RATE  # 160 → 50 Hz envelope
 _AUDIO_AGREE_S     = 0.3    # max note/audio diff (s) to trust the audio result
@@ -607,40 +614,167 @@ def _note_align_iterative(note_frame_weights, band_envs_rs, coarse_rate,
     return offset, score, passes_taken
 
 
+def _note_time_xcorr(ch_track_diffs, rs_arrangement, coarse_rate=50,
+                      anchor_s=None, window_s=20.0):
+    """Cross-correlate CH note onset times against RS arrangement note times.
+
+    Both are sparse spike trains at coarse_rate Hz, slightly smoothed so notes
+    within ±_NOTE_XCORR_WIN frames (±60 ms) still count as aligned.  Works even
+    when CH and RS are different recordings because it compares chart timing, not
+    audio.
+
+    anchor_s / window_s: constrain the search to anchor_s ± window_s seconds.
+    Guitar/bass arrangements are highly periodic (verse/chorus repeats) so an
+    unconstrained full-range xcorr picks up false peaks at multiples of the
+    song's repeat period.  Supply the K=0 natural beat-map offset as anchor_s
+    to disambiguate.
+
+    Returns (offset_s, score) — offset_s is the direct CH-chart→RS-audio
+    shift (no ch_audio_delay_s correction needed).
+    """
+    import numpy as np
+
+    if not ch_track_diffs:
+        return 0.0, 0.0
+    best_diff = max(ch_track_diffs.keys())
+    ch_times = sorted(h["time_ms"] / 1000.0 for h in ch_track_diffs[best_diff]
+                      if "time_ms" in h)
+
+    rs_times = []
+    for note in rs_arrangement.get("notes") or []:
+        rs_times.append(float(note["t"]))
+    for phrase in rs_arrangement.get("phrases") or []:
+        for level in phrase.get("levels") or []:
+            for note in level.get("notes") or []:
+                rs_times.append(float(note["t"]))
+    rs_times.sort()
+
+    if len(ch_times) < 20 or len(rs_times) < 20:
+        return 0.0, 0.0
+
+    na = int(ch_times[-1] * coarse_rate) + coarse_rate + 1
+    nb = int(rs_times[-1] * coarse_rate) + coarse_rate + 1
+    win = _NOTE_XCORR_WIN
+
+    ch_env = [0.0] * na
+    for t in ch_times:
+        c = int(t * coarse_rate)
+        for j in range(max(0, c - win), min(na, c + win + 1)):
+            ch_env[j] = max(ch_env[j], 1.0)
+
+    rs_env = [0.0] * nb
+    for t in rs_times:
+        c = int(t * coarse_rate)
+        for j in range(max(0, c - win), min(nb, c + win + 1)):
+            rs_env[j] = max(rs_env[j], 1.0)
+
+    ch_arr = np.array(_normalize(ch_env), dtype=np.float64)
+    rs_arr = np.array(_normalize(rs_env), dtype=np.float64)
+
+    n_fft = 1
+    while n_fft < na + nb - 1:
+        n_fft <<= 1
+    xcorr_fft = np.fft.irfft(
+        np.fft.rfft(ch_arr, n_fft) * np.conj(np.fft.rfft(rs_arr, n_fft)),
+        n_fft,
+    ).real
+
+    # Restrict lag search: if anchor_s given use ±window_s; else full range.
+    # Offset convention: offset_s = -lag / rate.  Lag = -round(offset * rate).
+    if anchor_s is not None:
+        anchor_lag = -round(anchor_s * coarse_rate)
+        half       = max(1, int(window_s * coarse_rate))
+        lo_lag     = anchor_lag - half
+        hi_lag     = anchor_lag + half
+    else:
+        lo_lag = -(nb - 1)
+        hi_lag = na - 1
+
+    all_lags = np.arange(lo_lag, hi_lag + 1, dtype=np.int32)
+    all_n = np.minimum(na - np.maximum(0, all_lags),
+                       nb - np.maximum(0, -all_lags))
+    valid = all_n >= 20
+    if not np.any(valid):
+        return 0.0, 0.0
+    valid_lags = all_lags[valid]
+    valid_n    = all_n[valid]
+    xcorr_idxs = np.where(valid_lags >= 0, valid_lags,
+                          n_fft + valid_lags)
+    # Guard against out-of-range indices (can happen at large negative lags)
+    in_range   = (xcorr_idxs >= 0) & (xcorr_idxs < n_fft)
+    if not np.any(in_range):
+        return 0.0, 0.0
+    corr_vals         = np.full(len(valid_lags), -np.inf)
+    corr_vals[in_range] = xcorr_fft[xcorr_idxs[in_range]] / valid_n[in_range]
+    best_idx   = int(np.argmax(corr_vals))
+    offset_s   = -float(valid_lags[best_idx]) / coarse_rate
+    score      = max(0.0, float(corr_vals[best_idx]))
+    return offset_s, score
+
+
 def _banded_xcorr_fine(band_envs_ch, band_envs_rs, coarse_rate,
                         anchor_s=None, window_s=2.0):
-    """Per-band xcorr (CH vs RS) within ±window_s of anchor_s.
+    """Per-band xcorr (CH vs RS).
 
-    anchor_s=None searches the full ±window_s range from lag=0 (use for coarse search).
-    Returns the correlation-weighted mean offset, or anchor_s (or 0) on failure.
+    anchor_s=None: FFT xcorr over the full audio length (no lag limit).
+    anchor_s=X: search ±window_s around X for sub-frame accuracy.
+    Returns (offset_s, corr_score).  corr_score is the correlation-weighted mean peak
+    correlation (0..1); higher = better match.  Returns (anchor_s or 0, 0.0) on failure.
     """
+    import numpy as np
+
     anchor_lag = 0 if anchor_s is None else -round(anchor_s * coarse_rate)
-    fine_max   = max(1, int(window_s * coarse_rate))
 
     results = []
     for band in ("kick", "snare", "cymbal"):
         ch_n = _normalize(band_envs_ch.get(band, []))
         rs_n = _normalize(band_envs_rs.get(band, []))
-        if not ch_n or not rs_n:
+        if len(ch_n) < 20 or len(rs_n) < 20:
             continue
         na, nb = len(ch_n), len(rs_n)
-        best_lag, best_corr = anchor_lag, float("-inf")
-        for lag in range(anchor_lag - fine_max, anchor_lag + fine_max + 1):
-            a0 = max(0, lag)
-            b0 = max(0, -lag)
-            n  = min(na - a0, nb - b0)
-            if n < 20:
-                continue
-            corr = sum(ch_n[a0 + k] * rs_n[b0 + k] for k in range(n)) / n
-            if corr > best_corr:
-                best_corr = corr
-                best_lag  = lag
+
+        ch_arr = np.array(ch_n, dtype=np.float64)
+        rs_arr = np.array(rs_n, dtype=np.float64)
+
+        # FFT-based linear cross-correlation — O(n log n), covers entire audio.
+        n_fft = 1
+        while n_fft < na + nb - 1:
+            n_fft <<= 1
+        xcorr_fft = np.fft.irfft(
+            np.fft.rfft(ch_arr, n_fft) * np.conj(np.fft.rfft(rs_arr, n_fft)),
+            n_fft,
+        ).real
+
+        if anchor_s is None:
+            # Full-song search: all lags where overlap ≥ 20 frames.
+            fine_max = min(na, nb) - 20
+        else:
+            fine_max = max(1, int(window_s * coarse_rate))
+
+        all_lags = np.arange(anchor_lag - fine_max, anchor_lag + fine_max + 1,
+                             dtype=np.int32)
+        all_n = np.minimum(na - np.maximum(0, all_lags),
+                           nb - np.maximum(0, -all_lags))
+        valid = all_n >= 20
+        if not np.any(valid):
+            continue
+        valid_lags = all_lags[valid]
+        valid_n    = all_n[valid]
+        xcorr_idxs = np.where(valid_lags >= 0, valid_lags, n_fft + valid_lags)
+        corr_vals  = xcorr_fft[xcorr_idxs] / valid_n
+        best_idx   = int(np.argmax(corr_vals))
+        best_lag   = int(valid_lags[best_idx])
+        best_corr  = float(corr_vals[best_idx])
+
         results.append((-best_lag / coarse_rate, max(0.0, best_corr)))
 
     if not results:
-        return anchor_s if anchor_s is not None else 0.0
+        fallback = anchor_s if anchor_s is not None else 0.0
+        return fallback, 0.0
     total_w = sum(c for _, c in results) or 1e-10
-    return sum(o * c for o, c in results) / total_w
+    offset_s   = sum(o * c for o, c in results) / total_w
+    corr_score = total_w / len(results)   # mean peak correlation across bands
+    return offset_s, corr_score
 
 
 def _score_banded(note_frame_weights, rs_band_envs, n_rs, max_lag,
@@ -737,20 +871,25 @@ def _audio_align(ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs=None):
                     print(f"({time.time()-t0:.1f}s)")
 
                 if verbose:
-                    print(f"  audio    : banded xcorr ±{_COARSE_SEARCH_S:.0f}s …",
+                    print(f"  audio    : banded xcorr full-range …",
                           end=" ", flush=True)
                 t0 = time.time()
-                offset_a = _banded_xcorr_fine(
+                offset_a, xcorr_score = _banded_xcorr_fine(
                     band_envs_ch, band_envs_rs, _COARSE_RATE,
                     anchor_s=None, window_s=_COARSE_SEARCH_S)
                 if verbose:
                     print(f"({time.time()-t0:.1f}s)")
-                    print(f"  audio    : xcorr {offset_a:+.3f}s  "
+                    print(f"  audio    : xcorr {offset_a:+.3f}s  score={xcorr_score:.4f}  "
                           f"[{ch_label} → {rs_label}]")
-                    print(f"  audio    : alignment total {time.time()-t0_total:.1f}s")
-                return offset_a, True
+                if xcorr_score >= _XCORR_SCORE_MIN:
+                    if verbose:
+                        print(f"  audio    : alignment total {time.time()-t0_total:.1f}s")
+                    return offset_a, True
+                if verbose:
+                    print(f"  audio    : xcorr low-confidence ({xcorr_score:.4f} < {_XCORR_SCORE_MIN}), "
+                          f"falling back to note→audio")
 
-            # --- Path 2: no CH audio → note-to-audio iterative scoring ---
+            # --- Path 2: no CH audio OR low-confidence xcorr → note-to-audio ---
             note_frame_weights = _prep_note_weights(
                 ch_note_band_pairs, None, _COARSE_RATE)
 
@@ -781,6 +920,12 @@ def _audio_align(ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs=None):
                       f"score={score_n:.4f}  {n_iters}/{_N_ALIGN_PASSES} passes  "
                       f"RS={rs_dur_s:.0f}s")
 
+            if score_n < _NOTE_SCORE_MIN:
+                if verbose:
+                    print(f"  audio    : note→audio low-confidence (score={score_n:.4f} < "
+                          f"{_NOTE_SCORE_MIN}) — alignment unreliable, using beat-map only; "
+                          f"try --offset if notes feel off")
+                return None, False
             if verbose:
                 print(f"  audio    : alignment total {time.time()-t0_total:.1f}s")
             return offset_n, True
@@ -913,7 +1058,7 @@ def _ibi_cross_correlate(ch_times, rs_times, max_k=128, prior_offset_s=None,
     for k in range(-search, search + 1):
         c0 = max(0,  k)
         r0 = max(0, -k)
-        n  = min(len(ch_ibis) - c0, len(rs_ibis) - r0, 64)
+        n  = min(len(ch_ibis) - c0, len(rs_ibis) - r0)  # entire song
         if n < 4:
             continue
         ibi_mse = sum(
@@ -921,7 +1066,7 @@ def _ibi_cross_correlate(ch_times, rs_times, max_k=128, prior_offset_s=None,
         ) / n
         score = ibi_mse
         if prior_offset_s is not None:
-            np_ = min(len(ch_times) - c0, len(rs_times) - r0, 64)
+            np_ = min(len(ch_times) - c0, len(rs_times) - r0)
             if np_ > 0:
                 mean_off = sum(
                     rs_times[r0 + i] - ch_times[c0 + i] for i in range(np_)
@@ -932,7 +1077,7 @@ def _ibi_cross_correlate(ch_times, rs_times, max_k=128, prior_offset_s=None,
             best_k     = k
 
     c0 = max(0,  best_k); r0 = max(0, -best_k)
-    n  = min(len(ch_ibis) - c0, len(rs_ibis) - r0, 64)
+    n  = min(len(ch_ibis) - c0, len(rs_ibis) - r0)
     ibi_mse = sum((ch_ibis[c0+i] - rs_ibis[r0+i])**2 for i in range(n)) / max(n, 1)
     return best_k, (ibi_mse ** 0.5) * 1000.0
 
@@ -986,9 +1131,22 @@ def _auto_align(ch_beats, rs_beats, prior_offset_s=None, prior_scale=2.0):
     if not ch_times or not rs_times:
         return lambda t: t, {"k": 0, "ibi_rms_ms": None, "mean_offset_ms": 0.0, "n_pairs": 0}
 
-    k, ibi_rms_ms = _ibi_cross_correlate(ch_times, rs_times,
-                                          prior_offset_s=prior_offset_s,
-                                          prior_scale=prior_scale)
+    if prior_offset_s is None:
+        # No audio prior: anchor IBI search to the K=0 natural beat-0 offset
+        # (mean time difference at zero shift).  This keeps the established
+        # beat interval while still letting IBI correct the starting phase by
+        # ±prior_scale seconds — enough to fix a few-beat phase error without
+        # drifting to a periodic xcorr false peak.
+        n0 = min(len(ch_times), len(rs_times))
+        natural_k0 = (sum(rs_times[i] - ch_times[i] for i in range(n0)) / n0
+                      if n0 else 0.0)
+        k, ibi_rms_ms = _ibi_cross_correlate(ch_times, rs_times,
+                                              prior_offset_s=natural_k0,
+                                              prior_scale=prior_scale)
+    else:
+        k, ibi_rms_ms = _ibi_cross_correlate(ch_times, rs_times,
+                                              prior_offset_s=prior_offset_s,
+                                              prior_scale=prior_scale)
 
     c0 = max(0,  k)
     r0 = max(0, -k)
@@ -1082,6 +1240,51 @@ def _write_merged(output_path, manifest_yaml, merged_arrangements,
             if any(name.startswith(p) for p in skip_prefixes):
                 continue
             zf_out.writestr(name, zf_in.read(name))
+
+
+# ---------------------------------------------------------------------------
+# Candidate scoring (used by batch to pick best among multiple RS matches)
+# ---------------------------------------------------------------------------
+
+def score_candidate(ch_dir, rs_sloppak_path):
+    """Return (offset_s, corr_score) for how well CH audio aligns to rs_sloppak_path.
+
+    corr_score is the mean peak banded xcorr (0..1); higher = better match.
+    Falls back to full CH mix when no drum stems are present.
+    Returns (None, 0.0) on any failure.
+    """
+    try:
+        ch_drum_files = _find_ch_drum_files(ch_dir)
+        if not ch_drum_files:
+            ch_audio = _find_ch_audio(ch_dir)
+            if not ch_audio:
+                return None, 0.0
+            ch_drum_files = [ch_audio]
+
+        rs_stem_name, _ = _pick_rs_stem(rs_sloppak_path)
+        if not rs_stem_name:
+            return None, 0.0
+
+        fd, rs_tmp = tempfile.mkstemp(suffix=".ogg")
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(rs_sloppak_path, "r") as zf:
+                with open(rs_tmp, "wb") as f:
+                    f.write(zf.read(rs_stem_name))
+            band_envs_ch = _extract_band_envs_paths(ch_drum_files)
+            band_envs_rs = _extract_band_envs(rs_tmp)
+            if not band_envs_ch or not band_envs_rs:
+                return None, 0.0
+            return _banded_xcorr_fine(
+                band_envs_ch, band_envs_rs, _COARSE_RATE,
+                anchor_s=None, window_s=_COARSE_SEARCH_S)
+        finally:
+            try:
+                os.unlink(rs_tmp)
+            except OSError:
+                pass
+    except Exception:
+        return None, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1191,6 +1394,51 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
                 if verbose and drum_anchor:
                     print("  align    : drum stems used as master reference")
 
+        # Note-time xcorr fallback: compare CH guitar/bass note onset times against
+        # RS arrangement times.  Works even across different recordings because it
+        # uses chart note timing, not audio.  Runs only when audio alignment failed.
+        # Guitar parts are highly periodic (verse/chorus), so anchor the search to
+        # the K=0 natural beat-map offset ± 20 s to reject periodic false peaks.
+        if prior_offset_s is None:
+            _nt_anchor = None
+            if ch_beats and rs["rs_beats"]:
+                _n0 = min(len(ch_beats), len(rs["rs_beats"]))
+                _nt_anchor = (sum(rs["rs_beats"][i]["time"] - ch_beats[i]["time"]
+                                  for i in range(_n0)) / _n0)
+            _note_xcorr_pairs = [
+                ("lead", "lead"), ("bass", "bass"),
+                ("lead", "lead-bonus"), ("lead", "rhythm"),
+            ]
+            for ch_tid, rs_id in _note_xcorr_pairs:
+                if (ch_tid in parsed["tracks"] and parsed["tracks"][ch_tid]
+                        and rs_id in rs["arrangements"]):
+                    nt_off, nt_score = _note_time_xcorr(
+                        parsed["tracks"][ch_tid],
+                        rs["arrangements"][rs_id],
+                        _COARSE_RATE,
+                        anchor_s=_nt_anchor,
+                        window_s=20.0,
+                    )
+                    if verbose:
+                        print(f"  note-xcorr: {ch_tid}↔{rs_id}  "
+                              f"{nt_off:+.3f}s  score={nt_score:.4f}")
+                    if nt_score >= _NOTE_XCORR_MIN:
+                        # Average note-xcorr with K=0 natural to cancel
+                        # measure-period aliasing: note-xcorr tends to find a
+                        # periodic false peak ~1 measure above the true offset,
+                        # while K=0 natural underestimates by ~1 measure.
+                        # Their midpoint lands at the correct phase.
+                        if _nt_anchor is not None:
+                            prior_offset_s = (_nt_anchor + nt_off) / 2.0
+                        else:
+                            prior_offset_s = nt_off
+                        if verbose:
+                            src = (f"avg(K0={_nt_anchor:+.3f}s, xcorr={nt_off:+.3f}s)={prior_offset_s:+.3f}s"
+                                   if _nt_anchor is not None else f"xcorr={nt_off:+.3f}s")
+                            print(f"  align    : note-time xcorr prior {src} "
+                                  f"({ch_tid}↔{rs_id})")
+                        break
+
         if nudge_ms:
             prior_offset_s = (prior_offset_s or 0.0) + nudge_ms / 1000.0
             if verbose:
@@ -1200,7 +1448,7 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
         # When drum stems provided the prior, use a tight scale (0.25 s) so the
         # beat K cannot drift more than ~250 ms from the drum-derived anchor —
         # the drums ARE the timing reference; IBI only handles tempo stretch.
-        prior_scale = 0.25 if drum_anchor else 2.0
+        prior_scale = 0.5 if drum_anchor else 2.0
         if ch_beats and rs["rs_beats"]:
             shift_fn, info = _auto_align(
                 ch_beats, rs["rs_beats"],
@@ -1214,7 +1462,8 @@ def merge(ch_dir, rs_sloppak_path, output_path=None, offset_ms=None, nudge_ms=0.
                 n   = info["n_pairs"]
                 k_desc  = f"K={k:+d}" if k != 0 else "K=0"
                 rms_str = f"{rms:.1f} ms" if rms is not None and rms < 9999 else "n/a"
-                anchor  = " [drum-anchored]" if drum_anchor else ""
+                anchor  = (" [drum-anchored]" if drum_anchor
+                           else " [beat-map only]" if prior_offset_s is None else "")
                 print(f"  beats    : {k_desc}, mean offset {off:+.1f} ms, IBI RMS {rms_str} ({n} pairs){anchor}")
                 if rms is not None and rms > 20.0:
                     print(f"  WARNING  : high IBI residual — try --offset if notes feel off")

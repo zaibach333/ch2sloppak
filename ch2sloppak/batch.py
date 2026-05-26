@@ -27,6 +27,8 @@ _DIFF_CAPS  = {3: "Expert", 2: "Hard", 1: "Medium", 0: "Easy"}
 # Fuzzy match thresholds (SequenceMatcher ratio, 0–1).
 _FUZZY_COMBINED_THRESHOLD = 0.85   # artist+title sequence similarity
 _FUZZY_DEEP_THRESHOLD     = 0.82   # artist+title after noise-token stripping
+_FUZZY_TITLE_MIN          = 0.60   # title-alone similarity floor — prevents same-artist
+                                   # cross-song matches (e.g. "Siva" matching "Today")
 
 # Common noise tokens stripped before deep comparison.
 _NOISE = re.compile(
@@ -51,51 +53,71 @@ def _sim(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 
-def find_match(artist, title, library_index):
+def find_all_matches(artist, title, library_index):
     """
-    Find the best matching sloppak for the given artist+title.
+    Find all matching sloppaks for the given artist+title.
 
-    Matching tiers (first hit wins):
-      1. Exact normalized key
+    Matching tiers (all candidates above threshold are returned):
+      1. Exact normalized key — all files sharing that key
       2. Sequence fuzzy on artist+title            ≥ FUZZY_COMBINED_THRESHOLD
       3. Sequence fuzzy deep (noise tokens stripped) ≥ FUZZY_DEEP_THRESHOLD
 
-    Returns (path, manifest, score_description) or (None, None, None).
+    Returns list of (path, manifest, score_description), best text match first.
+    Empty list if no match found.
     """
     norm_artist = _normalize(artist)
     norm_title  = _normalize(title)
     key         = (norm_artist + " " + norm_title).strip()
     deep_key    = (_normalize_deep(artist) + " " + _normalize_deep(title)).strip()
 
-    # Pre-compute per-candidate normalised strings once
-    candidates = []
-    for cand_key, (path, manifest) in library_index.items():
-        cand_deep = (_normalize_deep(manifest.get("artist", "")) + " " +
-                     _normalize_deep(manifest.get("title", ""))).strip()
-        candidates.append((path, manifest, cand_key, cand_deep))
+    # Pre-compute per-candidate normalised strings once (flatten all files)
+    flat = []
+    for cand_key, entries in library_index.items():
+        for path, manifest in entries:
+            cand_deep = (_normalize_deep(manifest.get("artist", "")) + " " +
+                         _normalize_deep(manifest.get("title", ""))).strip()
+            flat.append((path, manifest, cand_key, cand_deep))
 
     # 1. Exact
     if key in library_index:
-        return (*library_index[key], "exact")
+        return [(path, manifest, "exact")
+                for path, manifest in library_index[key]]
 
-    # 2. Sequence fuzzy on normalized artist+title
-    best_score, best_item = 0.0, None
-    for path, manifest, cand_norm, _ in candidates:
-        score = _sim(key, cand_norm)
-        if score > best_score:
-            best_score, best_item = score, (path, manifest)
-    if best_item and best_score >= _FUZZY_COMBINED_THRESHOLD:
-        return (*best_item, f"fuzzy {best_score:.0%}")
+    deep_title = _normalize_deep(title)
 
-    # 3. Sequence fuzzy after noise-token stripping
-    best_score, best_item = 0.0, None
-    for path, manifest, _, cand_deep in candidates:
-        score = _sim(deep_key, cand_deep)
-        if score > best_score:
-            best_score, best_item = score, (path, manifest)
-    if best_item and best_score >= _FUZZY_DEEP_THRESHOLD:
-        return (*best_item, f"fuzzy-deep {best_score:.0%}")
+    # 2. Sequence fuzzy on normalized artist+title (title floor applied)
+    scored = []
+    for path, manifest, cand_norm, cand_deep in flat:
+        cand_title = _normalize(manifest.get("title", ""))
+        if _sim(norm_title, cand_title) < _FUZZY_TITLE_MIN:
+            continue
+        sc = _sim(key, cand_norm)
+        scored.append((path, manifest, sc, cand_deep))
+    hits = [(path, manifest, f"fuzzy {sc:.0%}")
+            for path, manifest, sc, _ in scored if sc >= _FUZZY_COMBINED_THRESHOLD]
+    if hits:
+        return sorted(hits, key=lambda x: float(x[2].split()[1].rstrip("%")), reverse=True)
 
+    # 3. Sequence fuzzy after noise-token stripping (title floor applied to deep titles)
+    hits = []
+    for path, manifest, _, cand_deep in flat:
+        cand_title_deep = _normalize_deep(manifest.get("title", ""))
+        if _sim(deep_title, cand_title_deep) < _FUZZY_TITLE_MIN:
+            continue
+        sc = _sim(deep_key, cand_deep)
+        if sc >= _FUZZY_DEEP_THRESHOLD:
+            hits.append((path, manifest, f"fuzzy-deep {sc:.0%}"))
+    if hits:
+        return sorted(hits, key=lambda x: float(x[2].split()[1].rstrip("%")), reverse=True)
+
+    return []
+
+
+def find_match(artist, title, library_index):
+    """Return (path, manifest, score_description) for the best text match, or (None, None, None)."""
+    matches = find_all_matches(artist, title, library_index)
+    if matches:
+        return matches[0]
     return None, None, None
 
 
@@ -120,10 +142,8 @@ def _read_sloppak_manifest(sloppak_path):
 def build_library_index(library_dir):
     """
     Scan library_dir for .sloppak files.
-    Returns { normalize(artist+" "+title): (path, manifest) }.
-    First match per key wins (sorted filenames → deterministic).
-    The manifest is stored in the tuple so fuzzy matching can re-normalize
-    artist/title fields independently.
+    Returns { normalize(artist+" "+title): [(path, manifest), ...] }.
+    All files with the same normalised key are stored (sorted filenames).
     """
     index = {}
     for fname in sorted(os.listdir(library_dir)):
@@ -135,8 +155,7 @@ def build_library_index(library_dir):
             continue
         key = (_normalize(manifest.get("artist", "")) + " " +
                _normalize(manifest.get("title", "")))
-        if key not in index:
-            index[key] = (path, manifest)
+        index.setdefault(key, []).append((path, manifest))
     return index
 
 
@@ -291,10 +310,29 @@ def run(root_dir, output_dir=None, library_dir=None, force=False, verbose=True,
             # --- library match ---
             rs_path = rs_manifest = None
             if library_index:
-                rs_path, rs_manifest, match_desc = find_match(
-                    artist, title, library_index)
-                if rs_path and verbose:
-                    print(f"  Match ({match_desc}): {os.path.basename(rs_path)}")
+                candidates = find_all_matches(artist, title, library_index)
+                if candidates:
+                    if len(candidates) == 1:
+                        rs_path, rs_manifest, match_desc = candidates[0]
+                        if verbose:
+                            print(f"  Match ({match_desc}): {os.path.basename(rs_path)}")
+                    else:
+                        # Multiple RS sloppaks match — score each by audio xcorr
+                        if verbose:
+                            print(f"  {len(candidates)} candidates — scoring by audio …")
+                        best_score = -1.0
+                        rs_path, rs_manifest, match_desc = candidates[0]
+                        for cand_path, cand_manifest, cand_desc in candidates:
+                            _, sc = merge_mod.score_candidate(ch_dir, cand_path)
+                            if verbose:
+                                print(f"    {os.path.basename(cand_path)}: "
+                                      f"xcorr={sc:.4f}")
+                            if sc > best_score:
+                                best_score = sc
+                                rs_path, rs_manifest, match_desc = (
+                                    cand_path, cand_manifest, cand_desc)
+                        if verbose:
+                            print(f"  Best ({match_desc}): {os.path.basename(rs_path)}")
 
             if rs_path:
                 candidate_ids = predict_merge_ids(parsed["tracks"], split_drums=split_drums)

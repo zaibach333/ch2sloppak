@@ -48,32 +48,38 @@ python ch2sloppak.py merge <ch-folder> <rs.sloppak> --nudge -500
 python ch2sloppak.py merge <ch-folder> <rs.sloppak> --split-drums
 ```
 
-The merge command auto-aligns CH note timing to the RS audio in three stages:
+The merge command auto-aligns CH note timing to the RS audio in four stages:
 
-1. **80-pass iterative frequency-adaptive note-to-audio** — when a drum chart
-   is present, the RS stem is filtered into three frequency bands (kick <150 Hz,
-   snare 150–2500 Hz, cymbal >2500 Hz). If CH drum stems are available, a
-   per-type frequency fingerprint is built by searching a ±400 ms window around
-   each note's chart time and averaging the peak band energies across all notes
-   of that type. Aggregating over the whole song makes the fingerprint robust to
-   intro/outro length differences and timing drift between CH audio and chart.
-   Each note is then scored against RS using its type's learned weight vector
-   rather than a fixed frequency assumption. Notes with simultaneous hits within
-   20 ms are down-weighted by 1/(n_nearby+1). Without CH audio, weights fall
-   back to one-hot on the declared band type. The search window decays
-   exponentially from ±30 s to ±1 frame over 80 passes.
-2. **Banded CH-audio xcorr refinement** — if CH drum stems are present, they
-   are cross-correlated per-band against the RS bands within ±0.9 s of the
-   note-derived estimate. If the result agrees within 0.3 s it replaces the
-   note estimate for sub-frame accuracy; otherwise the note-derived offset is
-   kept. Falls back to full-song onset-envelope cross-correlation when no drum
-   chart is available at all.
-3. **Beat IBI** — piecewise beat-map cross-correlation handles residual tempo
-   stretch within the aligned window.
+1. **Lyrics prior** — if CH and RS share enough lyric text (≥20 inliers AND
+   ≥5% of all matches), their timestamps are used as a coarse offset.
+2. **Banded drum audio xcorr (primary)** — when CH drum stems are present, they
+   are cross-correlated per frequency band (kick <150 Hz, snare 150–2500 Hz,
+   cymbal >2500 Hz) against the same bands extracted from the RS drum stem over
+   the full song length via FFT. CH notes are already in sync with CH audio, so
+   this gives the CH→RS time offset directly. The result is the
+   correlation-weighted mean of the three band peaks. Requires score ≥ 0.12 to
+   be trusted; below that, falls through to note-to-audio scoring.
+3. **Note-to-audio scoring (fallback)** — used when drum xcorr scores too low
+   (e.g. different recordings). The RS stem is filtered into the same three
+   bands and 1045 drum hits are scored against band energies over 20 passes.
+   Requires score ≥ 0.05 to be trusted.
+4. **Note-time xcorr (second fallback)** — compares CH guitar/bass note onset
+   times against RS arrangement note times via FFT cross-correlation. Works
+   across different recordings because it uses chart timing rather than audio.
+   The result is averaged with the K=0 natural beat-map offset to cancel
+   measure-period aliasing (guitar riffs repeat every measure, so the xcorr
+   often finds a false peak one measure off; the K=0 natural estimate sits one
+   measure on the other side, and their midpoint lands on the correct phase).
+   Requires score ≥ 0.04 to be trusted.
+5. **Beat IBI** — piecewise inter-beat-interval cross-correlation finds the
+   integer beat shift K that minimises IBI MSE weighted by the prior from any
+   earlier stage, then builds a piecewise-linear CH→RS time function.
 
-The verbose output shows the note score, convergence pass count, audio xcorr
-result (accepted/rejected), beat shift (K), mean time offset, and IBI residual
-— if the residual is high (> 20 ms), use `--offset` to correct manually.
+The verbose output shows each stage's offset and score, beat shift (K), mean
+time offset, and IBI residual. If the residual is high (> 20 ms) and notes feel
+off, use `--offset` or `--nudge` to correct manually. High IBI residual on
+different-recording merges (live vs. studio etc.) is expected and does not
+indicate a problem.
 
 RS arrangements win on ID collision (e.g. if RS already has `lead`/`bass`,
 the CH gamepad versions are skipped). RS audio stems pass through unchanged;
@@ -119,7 +125,9 @@ are already present in the matched sloppak are also skipped silently.
 | `skipped.txt` | At least one output file was skipped due to already existing |
 
 Library matching normalises artist and title (lowercase, punctuation stripped)
-for comparison. First `.sloppak` match per song wins.
+for comparison, with fuzzy fallback for minor spelling differences. When
+multiple `.sloppak` files match a CH song by name, each candidate is scored by
+audio xcorr and the highest-scoring one is used.
 
 ## What gets converted
 
