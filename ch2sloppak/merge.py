@@ -196,6 +196,9 @@ _XCORR_SCORE_MIN   = 0.12   # minimum banded xcorr score to trust as drum anchor
 _NOTE_SCORE_MIN    = 0.05   # minimum note→audio score to trust as alignment prior
 _NOTE_XCORR_MIN    = 0.04   # minimum note-time xcorr score to use as prior
 _NOTE_XCORR_WIN    = 3      # ±frames (±60 ms at 50 Hz) smoothing for note onsets
+_FULL_XCORR_SR     = 200    # Hz — onset envelope rate for full-audio xcorr
+_FULL_XCORR_WIN    = 4      # samples per frame → 50 Hz output
+_FULL_XCORR_MIN    = 0.20   # minimum full-audio onset xcorr score to trust
 _CH_BAND_SR        = 8000   # sample rate for CH drum extraction (Python IIR filtered)
 _CH_BAND_WIN       = _CH_BAND_SR // _COARSE_RATE  # 160 → 50 Hz envelope
 _AUDIO_AGREE_S     = 0.3    # max note/audio diff (s) to trust the audio result
@@ -815,9 +818,106 @@ def _score_banded(note_frame_weights, rs_band_envs, n_rs, max_lag,
     return best_lag, best_score
 
 
+def _full_audio_xcorr(ch_dir, rs_sloppak_path, verbose):
+    """Cross-correlate CH full-mix audio against the RS full-mix stem.
+
+    For same-recording songs (the common case) this gives an exact offset in
+    one pass with no drum-stem or chart dependency.  Returns (offset_s, score)
+    where score is the normalised onset-envelope correlation (0–1).  Returns
+    (None, 0.0) if either audio file is missing or too short.
+    """
+    import numpy as np
+
+    ch_audio = _find_ch_audio(ch_dir)
+    if not ch_audio:
+        return None, 0.0
+
+    with zipfile.ZipFile(rs_sloppak_path, "r") as zf:
+        rs_stems = [n for n in zf.namelist()
+                    if n.startswith("stems/") and n.endswith(".ogg")]
+    if not rs_stems:
+        return None, 0.0
+
+    rs_entry = next((n for n in rs_stems
+                     if n in ("stems/full.ogg", "stems/song.ogg")), None)
+    if rs_entry is None:
+        rs_entry = next((n for n in rs_stems if "guitar" in n), rs_stems[0])
+
+    rs_tmp = None
+    try:
+        with zipfile.ZipFile(rs_sloppak_path, "r") as zf:
+            fd, rs_tmp = tempfile.mkstemp(suffix=".ogg")
+            os.close(fd)
+            with open(rs_tmp, "wb") as f:
+                f.write(zf.read(rs_entry))
+
+        stem_label = rs_entry.split("/")[-1]
+        if verbose:
+            print(f"  audio    : full-audio xcorr (CH mix ↔ RS {stem_label}) …",
+                  end=" ", flush=True)
+        t0 = time.time()
+
+        ch_pcm = _extract_pcm(ch_audio, _FULL_XCORR_SR)
+        rs_pcm = _extract_pcm(rs_tmp, _FULL_XCORR_SR)
+
+        if len(ch_pcm) < _FULL_XCORR_SR * 10 or len(rs_pcm) < _FULL_XCORR_SR * 10:
+            if verbose:
+                print("too short")
+            return None, 0.0
+
+        rate = _FULL_XCORR_SR // _FULL_XCORR_WIN
+        ch_env = _normalize(_onset_envelope(ch_pcm, _FULL_XCORR_WIN))
+        rs_env = _normalize(_onset_envelope(rs_pcm, _FULL_XCORR_WIN))
+        na, nb = len(ch_env), len(rs_env)
+
+        ch_arr = np.array(ch_env, dtype=np.float64)
+        rs_arr = np.array(rs_env, dtype=np.float64)
+        n_fft = 1
+        while n_fft < na + nb - 1:
+            n_fft <<= 1
+        xcorr = np.fft.irfft(
+            np.fft.rfft(ch_arr, n_fft) * np.conj(np.fft.rfft(rs_arr, n_fft)), n_fft
+        ).real
+
+        all_lags = np.arange(-(nb - 1), na, dtype=np.int32)
+        all_n    = np.minimum(na - np.maximum(0, all_lags),
+                              nb - np.maximum(0, -all_lags))
+        valid = all_n >= rate * 10
+        if not np.any(valid):
+            if verbose:
+                print("no valid lags")
+            return None, 0.0
+        valid_lags = all_lags[valid]
+        valid_n    = all_n[valid]
+        idxs       = np.where(valid_lags >= 0, valid_lags, n_fft + valid_lags)
+        in_range   = (idxs >= 0) & (idxs < n_fft)
+        if not np.any(in_range):
+            return None, 0.0
+        corr_vals  = np.full(len(valid_lags), -np.inf)
+        corr_vals[in_range] = xcorr[idxs[in_range]] / valid_n[in_range]
+        best_idx   = int(np.argmax(corr_vals))
+        offset_s   = -float(valid_lags[best_idx]) / rate
+        score      = max(0.0, float(corr_vals[best_idx]))
+
+        if verbose:
+            print(f"({time.time()-t0:.1f}s)")
+            print(f"  audio    : full-audio xcorr {offset_s:+.3f}s  score={score:.4f}")
+
+        return offset_s, score
+
+    finally:
+        if rs_tmp:
+            try:
+                os.unlink(rs_tmp)
+            except OSError:
+                pass
+
+
 def _audio_align(ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs=None):
     """Audio-based alignment.  Priority order:
 
+      0. Full-audio onset xcorr (CH mix vs RS full.ogg) — catches same-recording
+         songs instantly regardless of drum stem/chart availability.
       1. CH drum audio present → full-range banded xcorr (CH vs RS).
          Notes are already in sync with CH audio; xcorr gives the direct offset.
       2. Drum chart only, no CH audio → iterative note-to-audio scoring.
@@ -825,6 +925,13 @@ def _audio_align(ch_dir, rs_sloppak_path, verbose, ch_note_band_pairs=None):
 
     Returns (offset_seconds, drum_anchor: bool) or (None, False) on failure.
     """
+    # --- Step 0: full-audio onset xcorr ---
+    full_off, full_score = _full_audio_xcorr(ch_dir, rs_sloppak_path, verbose)
+    if full_score >= _FULL_XCORR_MIN:
+        if verbose:
+            print(f"  audio    : full-audio xcorr accepted (score={full_score:.4f})")
+        return full_off, True
+
     rs_stem_name, rs_label = _pick_rs_stem(rs_sloppak_path)
     if not rs_stem_name:
         if verbose:
