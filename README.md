@@ -48,30 +48,31 @@ python ch2sloppak.py merge <ch-folder> <rs.sloppak> --nudge -500
 python ch2sloppak.py merge <ch-folder> <rs.sloppak> --split-drums
 ```
 
-The merge command auto-aligns CH note timing to the RS audio in four stages:
+The merge command auto-aligns CH note timing to the RS audio in five stages:
 
 1. **Lyrics prior** — if CH and RS share enough lyric text (≥20 inliers AND
    ≥5% of all matches), their timestamps are used as a coarse offset.
-2. **Banded drum audio xcorr (primary)** — when CH drum stems are present, they
-   are cross-correlated per frequency band (kick <150 Hz, snare 150–2500 Hz,
-   cymbal >2500 Hz) against the same bands extracted from the RS drum stem over
-   the full song length via FFT. CH notes are already in sync with CH audio, so
-   this gives the CH→RS time offset directly. The result is the
-   correlation-weighted mean of the three band peaks. Requires score ≥ 0.12 to
-   be trusted; below that, falls through to note-to-audio scoring.
-3. **Note-to-audio scoring (fallback)** — used when drum xcorr scores too low
-   (e.g. different recordings). The RS stem is filtered into the same three
-   bands and 1045 drum hits are scored against band energies over 20 passes.
-   Requires score ≥ 0.05 to be trusted.
-4. **Note-time xcorr (second fallback)** — compares CH guitar/bass note onset
+2. **Full-audio onset xcorr** — cross-correlates the CH full-mix audio
+   (`song.ogg` / `guitar.ogg`) against the RS `full.ogg` stem using onset
+   envelopes. For same-recording songs (the common case) this gives an exact
+   offset in one fast pass regardless of drum stems or chart availability.
+   Requires score ≥ 0.20; below that falls through.
+3. **Banded drum audio xcorr** — when CH drum stems are present, they are
+   cross-correlated per frequency band (kick <150 Hz, snare 150–2500 Hz,
+   cymbal >2500 Hz) against the RS drum stem over the full song via FFT.
+   Requires score ≥ 0.12; below that falls through.
+4. **Note-to-audio scoring (fallback)** — used when audio xcorr scores too low
+   (e.g. different recordings). Drum hits from the chart are scored against RS
+   band energies over 20 passes. Requires score ≥ 0.05.
+5. **Note-time xcorr (second fallback)** — compares CH guitar/bass note onset
    times against RS arrangement note times via FFT cross-correlation. Works
    across different recordings because it uses chart timing rather than audio.
    The result is averaged with the K=0 natural beat-map offset to cancel
    measure-period aliasing (guitar riffs repeat every measure, so the xcorr
    often finds a false peak one measure off; the K=0 natural estimate sits one
    measure on the other side, and their midpoint lands on the correct phase).
-   Requires score ≥ 0.04 to be trusted.
-5. **Beat IBI** — piecewise inter-beat-interval cross-correlation finds the
+   Requires score ≥ 0.04.
+6. **Beat IBI** — piecewise inter-beat-interval cross-correlation finds the
    integer beat shift K that minimises IBI MSE weighted by the prior from any
    earlier stage, then builds a piecewise-linear CH→RS time function.
 
